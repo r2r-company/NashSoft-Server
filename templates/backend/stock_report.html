@@ -1,0 +1,232 @@
+<!DOCTYPE html>
+<html lang="uk">
+<head>
+  <meta charset="UTF-8" />
+  <title>NashSoft – API Dashboard</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+
+  <!-- Tailwind CSS -->
+  <script src="https://cdn.tailwindcss.com"></script>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="https://cdn.datatables.net/1.13.6/css/jquery.dataTables.min.css" />
+
+  <style>
+    body {
+      font-family: 'Inter', sans-serif;
+    }
+    .tab-button[aria-selected="true"] {
+      @apply bg-purple-600 text-white;
+    }
+  </style>
+</head>
+<body class="bg-gray-100 p-6">
+  <div class="max-w-7xl mx-auto space-y-8">
+    <div class="flex items-center justify-between">
+      <h1 class="text-3xl font-bold text-gray-800">📊 NashSoft – API Dashboard</h1>
+      <a href="/admin/" target="_blank" class="bg-purple-600 hover:bg-purple-700 text-white px-4 py-2 rounded">🔧 Відкрити адмінку</a>
+    </div>
+
+    <!-- Tabs -->
+    <div>
+      <div class="flex flex-wrap gap-2 mb-4" id="tabs">
+        {% for group_title, links in sections.items %}
+          <button class="tab-button px-4 py-2 rounded bg-white shadow text-gray-800 font-semibold transition"
+                  onclick="openTab({{ forloop.counter }})" data-tab="{{ forloop.counter }}"
+                  {% if forloop.first %}aria-selected="true"{% endif %}>
+            {{ group_title }}
+          </button>
+        {% endfor %}
+      </div>
+
+      {% for group_title, links in sections.items %}
+      <div class="tab-content space-y-6 bg-white rounded shadow p-6 {% if not forloop.first %}hidden{% endif %}" id="tab-{{ forloop.counter }}">
+        <h2 class="text-xl font-semibold text-gray-700">{{ group_title }}</h2>
+        <div class="flex flex-wrap gap-2">
+          {% for name, url in links %}
+            <button class="bg-purple-600 hover:bg-purple-700 text-white px-4 py-1 rounded text-sm"
+              onclick="loadSectionData('{{ name }}', '{{ url }}', 'output-{{ forloop.parentloop.counter }}-{{ forloop.counter }}', '{{ name|slugify }}')">
+              {{ name }}
+            </button>
+          {% endfor %}
+        </div>
+        {% for name, url in links %}
+        <div class="pt-4" id="output-{{ forloop.parentloop.counter }}-{{ forloop.counter }}">
+          <div class="text-gray-400 italic">🔄 Завантаження...</div>
+        </div>
+        {% endfor %}
+      </div>
+      {% endfor %}
+    </div>
+  </div>
+
+  <!-- Scripts -->
+  <script src="https://code.jquery.com/jquery-3.6.0.min.js"></script>
+  <script src="https://cdn.datatables.net/1.13.6/js/jquery.dataTables.min.js"></script>
+
+<!-- усі теги <head> як раніше, не змінюються -->
+<script>
+  const TOKEN = "{{ request.session.access_token|default:'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ0b2tlbl90eXBlIjoiYWNjZXNzIiwiZXhwIjoxNzQ4NDQ5NTk2LCJpYXQiOjE3NDc4NDQ3OTYsImp0aSI6IjljNDU0ZTNmNzgyMjRjMmQ4ZWFlZTQ1NzZhOGYyNGE4IiwidXNlcl9pZCI6Mn0.pAf-yaYTL7vv6PCQVN9O43C2FxmDK2xw73Sed0X7pz0' }}";
+
+const ukColumnNames = {
+  id: "ID",
+  doc_id: "ID документа",
+  supplier_id: "ID постачальника",
+  group_id: "ID групи",
+  company: "Компанія",
+  company_name: "Компанія",
+  firm: "Фірма",
+  firm_name: "Фірма",
+  customer: "Клієнт",
+  customer_name: "Клієнт",
+  supplier: "Постачальник",
+  supplier_name: "Постачальник",
+  account: "Рахунок",
+  account_code: "Код рахунку",
+  amount: "Сума",
+  total: "Сума",
+  total_with_vat: "Сума з ПДВ",
+  total_without_vat: "Сума без ПДВ",
+  vat_amount: "Сума ПДВ",
+  vat_total: "ПДВ разом",
+  vat_20: "ПДВ 20%",
+  vat_7: "ПДВ 7%",
+  vat_0: "ПДВ 0%",
+  vat_rate: "Ставка ПДВ",
+  doc_number: "Номер документа",
+  document_number: "Номер документа",
+  source_document_number: "Номер підстави",
+  source_document: "Док. підстава",
+  document: "Документ",
+  direction: "Напрям",
+  visible: "Видимий",
+  created_at: "Створено",
+  updated_at: "Оновлено",
+  date: "Дата",
+  comment: "Коментар",
+  status: "Статус",
+  product_name: "Товар",
+  name: "Назва",
+  unit: "Од. виміру (ID)",
+  unit_name: "Од. виміру",
+  quantity: "Кількість",
+  group_name: "Група товарів",
+  price: "Ціна",
+  debit: "Дебет",
+  credit: "Кредит",
+  debit_account: "Дт рахунок",
+  credit_account: "Кт рахунок",
+  paid: "Оплачено",
+  debt: "Борг",
+  balance: "Баланс",
+  total_received: "Надійшло",
+  total_paid: "Оплачено",
+  warehouse_name: "Склад",
+  doc_type: "Тип Документа",
+  id: "ІД",
+};
+
+const docTypeLabels = {
+  receipt: "Поступлення",
+  sale: "Реалізація",
+  return_to_supplier: "Повернення постачальнику",
+  return_from_client: "Повернення від клієнта",
+  transfer: "Переміщення",
+  inventory: "Інвентаризація",
+  adjustment: "Оприходування",
+  cash_income: "Надходження в касу",
+  cash_outcome: "Витрата з каси",
+  bank_income: "Надходження на рахунок",
+  bank_outcome: "Витрата з рахунку"
+
+};
+
+
+
+
+  function openTab(index) {
+    document.querySelectorAll('.tab-button').forEach(btn => {
+      btn.setAttribute('aria-selected', 'false');
+    });
+    document.querySelectorAll('.tab-content').forEach(c => c.classList.add('hidden'));
+    document.querySelector(`.tab-button[data-tab="${index}"]`).setAttribute('aria-selected', 'true');
+    document.getElementById(`tab-${index}`).classList.remove('hidden');
+  }
+
+  function loadSectionData(name, url, outputId, slug) {
+    const container = document.getElementById(outputId);
+    container.innerHTML = `<div class="text-gray-500 italic">🔄 Завантаження ${name}...</div>`;
+
+    fetch(url, {
+      headers: {
+        "Authorization": "Bearer " + TOKEN,
+        "Content-Type": "application/json"
+      }
+    })
+    .then(response => {
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      return response.json();
+    })
+    .then(data => {
+      if (!Array.isArray(data) || data.length === 0) {
+        container.innerHTML = `<div class="text-gray-400 italic">📭 Немає даних</div>`;
+        return;
+      }
+
+      const tableId = `table-${slug}-${Math.random().toString(36).slice(2, 8)}`;
+      const keys = Object.keys(data[0]);
+      let html = `
+      <table id="${tableId}" class="display w-full text-sm">
+        <thead><tr>`;
+      keys.forEach(k => {
+        const translated = ukColumnNames[k] || k;
+        html += `<th class="text-left">${translated}</th>`;
+      });
+      html += `</tr></thead><tbody>`;
+      data.forEach(row => {
+        html += `<tr>`;
+keys.forEach(k => {
+  let val = row[k] ?? '';
+  if (k === 'doc_type' && docTypeLabels[val]) {
+    val = docTypeLabels[val];
+  }
+  html += `<td>${val}</td>`;
+});
+        html += `</tr>`;
+      });
+      html += `</tbody></table>`;
+
+      container.innerHTML = `
+        <div class="bg-gradient-to-br from-purple-50 to-white rounded-xl shadow-md p-6 border border-purple-200 relative">
+          <div class="absolute -top-4 left-1/2 transform -translate-x-1/2 bg-purple-600 text-white px-4 py-1 rounded-full shadow text-sm font-semibold z-10">
+            🧾 Звіт: <strong>${name}</strong>
+          </div>
+          <div class="pt-8 overflow-x-auto">
+            ${html}
+          </div>
+        </div>
+      `;
+
+      $(`#${tableId}`).DataTable({
+        language: {
+          search: "🔍 Пошук:",
+          lengthMenu: "Показати _MENU_ записів",
+          info: "Показано _START_–_END_ з _TOTAL_",
+          paginate: { next: "Далі", previous: "Назад" },
+          emptyTable: "📭 Немає даних"
+        }
+      });
+    })
+    .catch(err => {
+      container.innerHTML = `<div class="text-red-600 font-semibold">❌ Помилка: ${err.message}</div>`;
+    });
+  }
+
+  window.addEventListener('DOMContentLoaded', () => {
+    document.querySelectorAll('.tab-content').forEach((tab, i) => {
+      tab.querySelectorAll('button').forEach(btn => btn.click());
+    });
+  });
+</script>
+
+</body>
+</html>

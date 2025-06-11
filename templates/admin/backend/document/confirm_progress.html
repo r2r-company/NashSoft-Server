@@ -1,0 +1,31 @@
+{#{% extends "admin/base_site.html" %}#}
+{##}
+{#{% block content %}#}
+{#<div class="card col-lg-6 offset-lg-3 mt-4">#}
+{#  <div class="card-header bg-warning text-dark fw-bold">#}
+{#    <i class="fas fa-exclamation-triangle"></i> Підтвердження дії#}
+{#  </div>#}
+{#  <div class="card-body">#}
+{#    <h4 class="card-title">Провести документ <strong>{{ document.doc_number }}</strong>?</h4>#}
+{#    <p class="card-text">Це дія незворотна. Ви впевнені?</p>#}
+{##}
+{#    <div class="d-flex justify-content-end mt-4">#}
+{#      <a href="/admin/backend/document/{{ document.id }}/change/" class="btn btn-secondary me-2">#}
+{#        ❌ Ні, назад#}
+{#      </a>#}
+{#      <button type="button" class="btn btn-success" id="confirm-btn">#}
+{#        ✅ Так, провести#}
+{#      </button>#}
+{#    </div>#}
+{#  </div>#}
+{#</div>#}
+{##}
+{#<script>#}
+{#document.getElementById("confirm-btn").addEventListener("click", async () => {#}
+{#    const res = await fetch("/api/document/?id={{ document.id }}&action=progress");#}
+{#    const data = await res.json();#}
+{#    alert(data.message || "Проведено.");#}
+{#    window.location.href = "/admin/backend/document/";#}
+{#});#}
+{#</script>#}
+{#{% endblock %}#}
