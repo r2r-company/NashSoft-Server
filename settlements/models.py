@@ -1,6 +1,4 @@
 from decimal import Decimal
-
-import self
 from django.db import models
 from backend.models import Company, Firm, Supplier, Customer, Document, PaymentType
 
