@@ -4,8 +4,8 @@ from rest_framework import serializers
 from rest_framework.serializers import ModelSerializer
 
 from backend.models import Document, DocumentItem, PriceSettingItem, PriceSettingDocument, Product, \
-    Company, Warehouse, Customer, Supplier, ProductGroup, PaymentType, Firm, Department, Unit, DOCUMENT_META, \
-    PriceType, TradePoint, CustomerType, Interface, AppUser
+    Company, Warehouse, Customer, Supplier, ProductGroup, PaymentType, Firm, Department, Unit,  \
+    PriceType, TradePoint, CustomerType, Interface, AppUser, ProductUnitConversion
 from backend.services.document_services import apply_vat
 from backend.services.price import get_price_from_setting
 
@@ -18,7 +18,7 @@ class DocumentItemSerializer(serializers.ModelSerializer):
     unit = serializers.PrimaryKeyRelatedField(queryset=Unit.objects.all(), required=False)
     vat_percent = serializers.DecimalField(max_digits=5, decimal_places=2, required=False)
     document = serializers.PrimaryKeyRelatedField(read_only=True)
-    role = serializers.CharField(required=False, allow_null=True)  # 💡 тип: "source"/"target" для фасування
+    role = serializers.CharField(required=False, allow_null=True)
 
     class Meta:
         model = DocumentItem
@@ -34,29 +34,67 @@ class DocumentItemSerializer(serializers.ModelSerializer):
                     "role": "Для фасування потрібно вказати роль: 'source' або 'target'."
                 })
 
+        # ⬇️ НОВА ВАЛІДАЦІЯ ЦІН
+        doc_type = doc.doc_type if doc else data.get('doc_type')
+
+        if doc_type == 'receipt':
+            # Для поступлень ціна обов'язкова
+            if 'price' not in data or not data['price']:
+                raise serializers.ValidationError({
+                    "price": "Для поступлення потрібно вказати ціну закупки."
+                })
+
+        elif doc_type == 'conversion' and data.get('role') == 'target':
+            # Для target товарів у фасуванні ціна розраховується автоматично
+            if 'price' in data:
+                data['price'] = 0  # Буде перерахована при проведенні
+
         return data
 
     def create(self, validated_data):
-        # 💡 Автопідстановка одиниці виміру
+        from backend.models import AccountingSettings
+
+        # Автопідстановка одиниці виміру
         if 'unit' not in validated_data or not validated_data['unit']:
             validated_data['unit'] = validated_data['product'].unit
 
-        # 💡 Автопідстановка ставки ПДВ
-        if 'vat_percent' not in validated_data or validated_data['vat_percent'] is None:
-            validated_data['vat_percent'] = validated_data['product'].vat_rate or 0
+        # Перевіряємо тип фірми для ПДВ
+        document = self.context.get('document')
+        firm = document.firm if document else None
 
-        # 💡 Вирахування ціни без ПДВ і суми ПДВ
+        if firm and not firm.is_vat_payer:
+            # ФОП - без ПДВ
+            validated_data['vat_percent'] = 0
+        else:
+            # ТОВ/ТЗОВ/ПАТ - з ПДВ
+            if 'vat_percent' not in validated_data or validated_data['vat_percent'] is None:
+                try:
+                    if document:
+                        settings = AccountingSettings.objects.get(company=document.company)
+                        validated_data['vat_percent'] = settings.default_vat_rate
+                    else:
+                        validated_data['vat_percent'] = 20
+                except AccountingSettings.DoesNotExist:
+                    validated_data['vat_percent'] = 20
+
+        # Вирахування ціни без ПДВ і суми ПДВ
         price = validated_data.get('price', 0)
         vat_percent = validated_data.get('vat_percent', 0)
-        price_without_vat = round(price / (1 + vat_percent / 100), 2)
-        vat_amount = round(price - price_without_vat, 2)
 
-        validated_data['price_without_vat'] = price_without_vat
-        validated_data['vat_amount'] = vat_amount
-        validated_data['price_with_vat'] = price  # для надійності
+        if price > 0 and vat_percent > 0:
+            price_without_vat = round(price / (1 + vat_percent / 100), 2)
+            vat_amount = round(price - price_without_vat, 2)
+
+            validated_data['price_without_vat'] = price_without_vat
+            validated_data['vat_amount'] = vat_amount
+            validated_data['price_with_vat'] = price
+        else:
+            # Без ПДВ
+            validated_data['price_without_vat'] = price
+            validated_data['vat_amount'] = 0
+            validated_data['price_with_vat'] = price
 
         return super().create(validated_data)
-
     class Meta:
         model = DocumentItem
         fields = "__all__"
@@ -112,7 +150,8 @@ class DocumentSerializer(serializers.ModelSerializer):
         price_type = validated_data.pop("price_type", None)
 
         with transaction.atomic():
-            validated_data['doc_number'] = generate_document_number(validated_data['doc_type'])
+            validated_data['doc_number'] = generate_document_number(validated_data['doc_type'],
+                                                                    validated_data['company'])
             validated_data['status'] = 'draft'
             document = Document.objects.create(**validated_data)
 
@@ -120,7 +159,9 @@ class DocumentSerializer(serializers.ModelSerializer):
                 if 'unit' not in item or not item['unit']:
                     item['unit'] = item['product'].unit
 
+                # ⬇️ НОВА ЛОГІКА ЦІН ДЛЯ РІЗНИХ ДОКУМЕНТІВ
                 if validated_data['doc_type'] == 'sale':
+                    # Для продажів - отримуємо ціну з прайсу
                     if 'price' not in item or item['price'] is None:
                         pt = price_type or PriceType.objects.filter(is_default=True).first()
                         price = get_price_from_setting(
@@ -135,8 +176,21 @@ class DocumentSerializer(serializers.ModelSerializer):
                             })
                         item['price'] = price
 
-                    if 'vat_percent' not in item or item['vat_percent'] is None:
-                        item['vat_percent'] = 20
+                elif validated_data['doc_type'] == 'receipt':
+                    # Для поступлень - ціна = собівартість закупки
+                    if 'price' not in item or item['price'] is None:
+                        raise serializers.ValidationError({
+                            'items': [f"Для поступлення потрібно вказати ціну закупки товару '{item['product']}'."]
+                        })
+
+                elif validated_data['doc_type'] == 'conversion':
+                    # Для фасування - ціни не потрібні (рахуються автоматично)
+                    if 'price' not in item:
+                        item['price'] = 0  # Тимчасово, буде перерахована при проведенні
+
+                # ⬇️ Автопідстановка ПДВ
+                if 'vat_percent' not in item or item['vat_percent'] is None:
+                    item['vat_percent'] = 20
 
                 item_instance = DocumentItem.objects.create(document=document, **item)
                 apply_vat(item_instance)
@@ -201,11 +255,13 @@ class PriceSettingItemSerializer(serializers.ModelSerializer):
 
 
 class PriceSettingDocumentSerializer(serializers.ModelSerializer):
+    id = serializers.IntegerField(read_only=True)  # ← додаєш це
     items = PriceSettingItemSerializer(many=True)
 
     class Meta:
         model = PriceSettingDocument
         fields = [
+            'id',  # ← і тут
             'doc_number', 'company', 'firm', 'valid_from', 'status',
             'base_type', 'base_group', 'base_receipt', 'base_price_type',
             'trade_points', 'items'
@@ -458,3 +514,11 @@ class TradePointSerializer(serializers.ModelSerializer):
     class Meta:
         model = TradePoint
         fields = ['id', 'name', 'firm', 'firm_name']
+
+
+
+class ProductUnitConversionSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = ProductUnitConversion
+        fields = '__all__'
+

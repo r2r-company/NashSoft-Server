@@ -6,18 +6,6 @@ from django.utils.translation import gettext_lazy as _
 from django.db import models
 from django.contrib.postgres.fields import ArrayField
 
-DOC_TYPE_CODES = {
-    'receipt': '703',
-    'sale': '704',
-    'return_to_supplier': '705',
-    'return_from_client': '706',
-    'transfer': '707',
-    'inventory': '708',
-    'stock_in': '709',
-    'conversion': '710',
-
-}
-
 
 # ========== ДОВІДНИКИ ==========
 
@@ -36,14 +24,32 @@ class Company(models.Model):
 class Firm(models.Model):
     company = models.ForeignKey(Company, on_delete=models.CASCADE)
     name = models.CharField(max_length=255)
-    vat_type = models.CharField(max_length=20, choices=[('ФОП', 'ФОП'), ('ТЗОВ', 'ТЗОВ'), ('ТОВ', 'ТОВ')])
+    vat_type = models.CharField(
+        max_length=20,
+        choices=[
+            ('ФОП', 'ФОП (без ПДВ)'),
+            ('ТОВ', 'ТОВ (з ПДВ)'),
+            ('ТЗОВ', 'ТЗОВ (з ПДВ)'),
+            ('ПАТ', 'ПАТ (з ПДВ)'),
+            ('ПрАТ', 'ПрАТ (з ПДВ)'),
+        ]
+    )
+    is_vat_payer = models.BooleanField(
+        verbose_name="Платник ПДВ",
+        help_text="Чи сплачує фірма ПДВ"
+    )
+
+    def save(self, *args, **kwargs):
+        # Автоматично встановлюємо is_vat_payer
+        self.is_vat_payer = self.vat_type in ['ТОВ', 'ТЗОВ', 'ПАТ', 'ПрАТ']
+        super().save(*args, **kwargs)
 
     def __str__(self):
         return self.name
 
     class Meta:
         verbose_name = 'Фірма'
-        verbose_name_plural = 'Фірма'
+        verbose_name_plural = 'Фірми'
 
 
 class Warehouse(models.Model):
@@ -182,6 +188,7 @@ class ProductUnitConversion(models.Model):
         verbose_name = "Конвертація одиниць"
         verbose_name_plural = "Конвертації одиниць"
 
+
 class CustomerType(models.Model):
     name = models.CharField(_('Назва типу'), max_length=100)
 
@@ -228,56 +235,92 @@ class PaymentType(models.Model):
         verbose_name_plural = 'Типи оплат'
 
 
-DOCUMENT_META = {
-    "receipt": {
-        "prefix": "703",
-        "entries": [
-            {"debit": "281", "credit": "631", "amount": "price_without_vat"},
-            {"debit": "644", "credit": "631", "amount": "vat_amount"},
-        ],
-    },
-    "sale": {
-        "prefix": "704",
-        "entries": [
-            {"debit": "361", "credit": "701", "amount": "price_without_vat"},
-            {"debit": "361", "credit": "641", "amount": "vat_amount"},
-        ],
-    },
-    "return_to_supplier": {
-        "prefix": "RTS",
-        "entries": [
-            {"debit": "631", "credit": "281", "amount": "price_without_vat"},
-            {"debit": "631", "credit": "644", "amount": "vat_amount"},
-        ],
-    },
+def get_document_meta(document):
+    """Отримати метадані для документа з налаштувань компанії"""
+    try:
+        acc_settings = AccountingSettings.objects.get(company=document.company)
+    except AccountingSettings.DoesNotExist:
+        # Фолбек на старі значення
+        acc_settings = type('obj', (object,), {
+            'stock_account': '281',
+            'supplier_account': '631',
+            'vat_input_account': '644',
+            'client_account': '361',
+            'revenue_account': '701',
+            'vat_output_account': '641'
+        })()
 
-    "return_from_client": {
-        "prefix": "RFC",
-        "entries": [
-            {"debit": "281", "credit": "361", "amount": "price_without_vat"},
-            {"debit": "641", "credit": "361", "amount": "vat_amount"},
-        ],
-    },
+    # Отримуємо префікси з DocumentSettings
+    try:
+        doc_settings = DocumentSettings.objects.get(company=document.company)
+    except DocumentSettings.DoesNotExist:
+        doc_settings = type('obj', (object,), {
+            'receipt_prefix': '703',
+            'sale_prefix': '704',
+            'return_to_supplier_prefix': 'RTS',
+            'return_from_client_prefix': 'RFC',
+            'transfer_prefix': 'TRF',
+            'inventory_prefix': 'INV',
+            'stock_in_prefix': 'STI',
+        })()
 
-    "transfer": {
-        "prefix": "TRF",
-        "entries": [
-            {"debit": "281", "credit": "281", "amount": "price_without_vat"},  # умовно, якщо сума відома
-        ],
-    },
+    meta_map = {
+        "receipt": {
+            "prefix": doc_settings.receipt_prefix,
+            "entries": [
+                {"debit": acc_settings.stock_account, "credit": acc_settings.supplier_account,
+                 "amount": "price_without_vat"},
+                {"debit": acc_settings.vat_input_account, "credit": acc_settings.supplier_account,
+                 "amount": "vat_amount"},
+            ],
+        },
+        "sale": {
+            "prefix": doc_settings.sale_prefix,
+            "entries": [
+                {"debit": acc_settings.client_account, "credit": acc_settings.revenue_account,
+                 "amount": "price_without_vat"},
+                {"debit": acc_settings.client_account, "credit": acc_settings.vat_output_account,
+                 "amount": "vat_amount"},
+            ],
+        },
+        "return_to_supplier": {
+            "prefix": doc_settings.return_to_supplier_prefix,
+            "entries": [
+                {"debit": acc_settings.supplier_account, "credit": acc_settings.stock_account,
+                 "amount": "price_without_vat"},
+                {"debit": acc_settings.supplier_account, "credit": acc_settings.vat_input_account,
+                 "amount": "vat_amount"},
+            ],
+        },
+        "return_from_client": {
+            "prefix": doc_settings.return_from_client_prefix,
+            "entries": [
+                {"debit": acc_settings.stock_account, "credit": acc_settings.client_account,
+                 "amount": "price_without_vat"},
+                {"debit": acc_settings.vat_output_account, "credit": acc_settings.client_account,
+                 "amount": "vat_amount"},
+            ],
+        },
+        "transfer": {
+            "prefix": doc_settings.transfer_prefix,
+            "entries": [
+                {"debit": acc_settings.stock_account, "credit": acc_settings.stock_account,
+                 "amount": "price_without_vat"},
+            ],
+        },
+        "inventory": {
+            "prefix": doc_settings.inventory_prefix,
+            "entries": [],
+        },
+        "stock_in": {
+            "prefix": doc_settings.stock_in_prefix,
+            "entries": [
+                {"debit": acc_settings.stock_account, "credit": "719", "amount": "price_without_vat"},
+            ],
+        },
+    }
 
-    "inventory": {
-        "prefix": "INV",
-        "entries": [],  # бо це внутрішній документ, бухпроводок може не бути
-    },
-
-    "stock_in": {
-        "prefix": "STI",
-        "entries": [
-            {"debit": "281", "credit": "719", "amount": "price_without_vat"},
-        ],
-    },
-}
+    return meta_map.get(document.doc_type, {})
 
 
 # ========== ДОКУМЕНТИ ==========
@@ -285,6 +328,7 @@ DOCUMENT_META = {
 class Document(models.Model):
     DOC_TYPES = [
         ('receipt', _('Поступлення')),
+        ('inventory_in', 'Оприбуткування'),
         ('sale', _('Реалізація')),
         ('return_from_client', _('Повернення від клієнта')),
         ('return_to_supplier', _('Повернення постачальнику')),
@@ -340,10 +384,39 @@ class Document(models.Model):
     )
 
     def get_prefix(self):
-        return DOCUMENT_META.get(self.doc_type, {}).get("prefix", "DOC")
+        """Отримати префікс документа з налаштувань компанії"""
+        try:
+            settings = DocumentSettings.objects.get(company=self.company)
+        except DocumentSettings.DoesNotExist:
+            # Фолбек на старі значення
+            fallback = {
+                'receipt': '703',
+                'sale': '704',
+                'return_to_supplier': 'RTS',
+                'return_from_client': 'RFC',
+                'transfer': 'TRF',
+                'inventory': 'INV',
+                'stock_in': 'STI',
+                'conversion': 'CNV',
+            }
+            return fallback.get(self.doc_type, 'DOC')
+
+        # Маппінг типів документів на поля налаштувань
+        prefix_map = {
+            'receipt': settings.receipt_prefix,
+            'sale': settings.sale_prefix,
+            'return_to_supplier': settings.return_to_supplier_prefix,
+            'return_from_client': settings.return_from_client_prefix,
+            'transfer': settings.transfer_prefix,
+            'inventory': settings.inventory_prefix,
+            'stock_in': settings.stock_in_prefix,
+            'conversion': settings.conversion_prefix,
+        }
+
+        return prefix_map.get(self.doc_type, 'DOC')
 
     def get_accounting_entry(self):
-        meta = DOCUMENT_META.get(self.doc_type, {})
+        meta = get_document_meta(self)
         return {
             "debit": meta.get("debit"),
             "credit": meta.get("credit"),
@@ -466,12 +539,29 @@ class DocumentItem(models.Model):
 
 
 # ========== ОПЕРАЦІЇ ==========
-
 class Operation(models.Model):
     document = models.ForeignKey(Document, on_delete=models.CASCADE, verbose_name=_('Документ'))
     product = models.ForeignKey(Product, on_delete=models.CASCADE, verbose_name=_('Товар'))
     quantity = models.DecimalField(_('Кількість'), max_digits=10, decimal_places=2)
-    price = models.DecimalField(_('Ціна'), max_digits=10, decimal_places=2)
+
+    # ⬇️ НОВА СИСТЕМА ЦІН
+    cost_price = models.DecimalField(_('Собівартість'), max_digits=10, decimal_places=2, default=0,
+                                     help_text="Собівартість одиниці")
+    sale_price = models.DecimalField(_('Ціна продажу'), max_digits=10, decimal_places=2, null=True, blank=True,
+                                     help_text="Ціна продажу одиниці")
+
+    # ⬇️ РОЗРАХУНКОВІ ПОЛЯ
+    total_cost = models.DecimalField(_('Загальна собівартість'), max_digits=12, decimal_places=2, default=0,
+                                     help_text="cost_price * quantity")
+    total_sale = models.DecimalField(_('Загальна сума продажу'), max_digits=12, decimal_places=2, null=True, blank=True,
+                                     help_text="sale_price * quantity")
+    profit = models.DecimalField(_('Прибуток'), max_digits=12, decimal_places=2, null=True, blank=True,
+                                 help_text="total_sale - total_cost")
+
+    # ⬇️ СТАРЕ ПОЛЕ (для зворотної сумісності поки що)
+    price = models.DecimalField(_('Ціна (застаріле)'), max_digits=10, decimal_places=2, default=0,
+                                help_text="Тимчасово для сумісності")
+
     source_operation = models.ForeignKey('self', null=True, blank=True, on_delete=models.SET_NULL,
                                          verbose_name=_('Партія'))
     warehouse = models.ForeignKey(Warehouse, on_delete=models.CASCADE, verbose_name=_('Склад'))
@@ -479,13 +569,27 @@ class Operation(models.Model):
     direction = models.CharField(_('Напрямок'), max_length=10)  # in/out
     created_at = models.DateTimeField(_('Створено'), auto_now_add=True)
 
+    def save(self, *args, **kwargs):
+        """Автоматично рахуємо суми при збереженні"""
+        self.total_cost = self.cost_price * self.quantity
+
+        if self.sale_price:
+            self.total_sale = self.sale_price * self.quantity
+            self.profit = self.total_sale - self.total_cost
+
+        # Для зворотної сумісності з існуючим кодом
+        if not self.price:
+            self.price = self.cost_price
+
+        super().save(*args, **kwargs)
+
     class Meta:
         ordering = ['created_at']
         verbose_name = 'Операція'
         verbose_name_plural = 'Операції'
 
     def __str__(self):
-        return f"{self.direction.upper()} {self.product.name} x {self.quantity}"
+        return f"{self.direction.upper()} {self.product.name} x {self.quantity} (собівартість: {self.cost_price})"
 
 
 class AuditLog(models.Model):
@@ -517,9 +621,6 @@ class PriceType(models.Model):
 
     def __str__(self):
         return self.name
-
-
-from backend.models import Firm  # якщо ще не імпортнув
 
 
 class PriceSettingDocument(models.Model):
@@ -669,3 +770,52 @@ class DiscountRule(models.Model):
 
     def __str__(self):
         return f"{self.name} - {self.percent}%"
+
+
+class AccountingSettings(models.Model):
+    company = models.OneToOneField(Company, on_delete=models.CASCADE)
+
+    # Рахунки для товарів
+    stock_account = models.CharField("Рахунок товарів", max_length=10, default="281")
+    supplier_account = models.CharField("Рахунок постачальників", max_length=10, default="631")
+    vat_input_account = models.CharField("ПДВ вхідний", max_length=10, default="644")
+
+    # Рахунки для продажів
+    client_account = models.CharField("Рахунок клієнтів", max_length=10, default="361")
+    revenue_account = models.CharField("Рахунок доходів", max_length=10, default="701")
+    vat_output_account = models.CharField("ПДВ вихідний", max_length=10, default="641")
+
+    # Ставки ПДВ
+    default_vat_rate = models.DecimalField("Ставка ПДВ за замовчуванням (%)", max_digits=5, decimal_places=2,
+                                           default=20.00)
+    reduced_vat_rate = models.DecimalField("Знижена ставка ПДВ (%)", max_digits=5, decimal_places=2, default=7.00)
+    zero_vat_rate = models.DecimalField("Нульова ставка ПДВ (%)", max_digits=5, decimal_places=2, default=0.00)
+
+    # ⬇️ ДОДАЙТЕ ЦЕ ПОЛЕ:
+    default_price_type = models.ForeignKey(
+        'PriceType',
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        verbose_name="Тип ціни за замовчуванням"
+    )
+
+    class Meta:
+        verbose_name = "Налаштування обліку"
+
+
+class DocumentSettings(models.Model):
+    company = models.OneToOneField(Company, on_delete=models.CASCADE, related_name='doc_settings')
+
+    # Префікси документів
+    receipt_prefix = models.CharField("Префікс поступлень", max_length=10, default="703")
+    sale_prefix = models.CharField("Префікс продажів", max_length=10, default="704")
+    return_to_supplier_prefix = models.CharField("Префікс повернень постачальнику", max_length=10, default="RTS")
+    return_from_client_prefix = models.CharField("Префікс повернень від клієнта", max_length=10, default="RFC")
+    transfer_prefix = models.CharField("Префікс переміщень", max_length=10, default="TRF")
+    inventory_prefix = models.CharField("Префікс інвентаризації", max_length=10, default="INV")
+    stock_in_prefix = models.CharField("Префікс оприбуткування", max_length=10, default="STI")
+    conversion_prefix = models.CharField("Префікс фасування", max_length=10, default="CNV")
+
+    class Meta:
+        verbose_name = "Налаштування документів"

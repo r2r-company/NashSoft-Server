@@ -7,17 +7,17 @@ from backend.models import (
     PriceType, PriceSettingDocument, PriceSettingItem,
     TradePoint, ProductUnitConversion, Unit
 )
-from unfold.admin import ModelAdmin as UnfoldModelAdmin
+from unfold.admin import  ModelAdmin, TabularInline
 
 
 @admin.register(PriceType)
-class PriceTypeAdmin(UnfoldModelAdmin):
+class PriceTypeAdmin(ModelAdmin):
     list_display = ('name', 'is_default')
     list_filter = ('is_default',)
     search_fields = ('name',)
 
 
-class PriceSettingItemInline(admin.TabularInline):
+class PriceSettingItemInline(TabularInline):
     model = PriceSettingItem
     form = PriceSettingItemForm
     extra = 0
@@ -64,7 +64,7 @@ class PriceSettingItemInline(admin.TabularInline):
 
 
 @admin.register(PriceSettingDocument)
-class PriceSettingDocumentAdmin(UnfoldModelAdmin):
+class PriceSettingDocumentAdmin(ModelAdmin):
     list_display = ('doc_number', 'company', 'valid_from', 'status')
     list_filter = ('company', 'status')
     search_fields = ('doc_number',)

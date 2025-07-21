@@ -1,5 +1,5 @@
 from backend.services.document_services import ReceiptService, SaleService, TransferService, ReturnToSupplierService, \
-    ReturnFromClientService, InventoryService, StockInDocumentService
+    ReturnFromClientService, InventoryService, StockInDocumentService, ConversionDocumentService
 
 
 def get_document_service(document):
@@ -10,7 +10,8 @@ def get_document_service(document):
         'transfer': TransferService,
         'return_from_client': ReturnFromClientService,
         'inventory': InventoryService,
-        'stock_in': StockInDocumentService,  # ⬅️ ДОДАВ ЦЕЙ РЯДОК
+        'stock_in': StockInDocumentService,
+        'conversion': ConversionDocumentService,
     }
 
     service_class = service_map.get(document.doc_type)

@@ -1,12 +1,12 @@
 from decimal import Decimal
 from settlements.models import MoneyLedgerEntry
-from backend.models import Document, DOCUMENT_META
+from backend.models import Document, get_document_meta
 
 
 class AccountingService:
     def __init__(self, document: Document):
         self.document = document
-        self.meta = DOCUMENT_META.get(document.doc_type, {})
+        self.meta = get_document_meta(self.document)
 
     def generate_entries(self):
         if not self.meta or "entries" not in self.meta:

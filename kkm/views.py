@@ -90,10 +90,26 @@ def get_workstation_from_request(request):
     raise ValueError("Не передано APP KEY або pc_name")
 
 
-def get_product_price(product, price_type_name='Роздрібна'):
-    price_type = PriceType.objects.filter(name=price_type_name).first()
+def get_product_price(product, price_type_name=None):
+    from backend.models import AccountingSettings
+
+
+
+    # Якщо тип ціни не переданий, беремо з налаштувань
+    if not price_type_name:
+        try:
+            settings = AccountingSettings.objects.get(company=product.firm.company)
+            if settings.default_price_type:
+                price_type = settings.default_price_type
+            else:
+                price_type = PriceType.objects.filter(is_default=True).first()
+        except AccountingSettings.DoesNotExist:
+            price_type = PriceType.objects.filter(is_default=True).first()
+    else:
+        price_type = PriceType.objects.filter(name=price_type_name).first()
+
     if not price_type:
-        raise ValueError(f"Тип ціни '{price_type_name}' не знайдено")
+        raise ValueError(f"Тип ціни не знайдено")
 
     company = product.firm.company
 
@@ -101,7 +117,7 @@ def get_product_price(product, price_type_name='Роздрібна'):
         status='approved',
         valid_from__lte=date.today(),
         company=company
-    ).order_by('-valid_from')  # 🔁 ВСІ, від новіших до старіших
+    ).order_by('-valid_from')
 
     for price_doc in price_docs:
         item = PriceSettingItem.objects.filter(
@@ -111,10 +127,9 @@ def get_product_price(product, price_type_name='Роздрібна'):
         ).first()
 
         if item:
-            return item.price  # ✅ Ціну знайшли — віддаємо
+            return item.price
 
-    raise ValueError(f"Ціну не знайдено для товару '{product.name}' в жодному документі ціноутворення")
-
+    raise ValueError(f"Ціну не знайдено для товару '{product.name}' з типом ціни '{price_type.name}'")
 
 
 class PrintMultiFirmReceiptsView(APIView):

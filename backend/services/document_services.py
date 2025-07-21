@@ -1,11 +1,21 @@
 # services/document_services.py (з повним логуванням)
 from decimal import Decimal
-
-from django.core.exceptions import ValidationError
 from django.db import transaction
 from django.db.models import Sum, Q
 
-from backend.models import Operation, DocumentItem
+from backend.exceptions import (
+    InsufficientStockError,
+    DocumentAlreadyPostedException,
+    DocumentNotPostedException,
+    ValidationError,
+    InvalidDocumentTypeError,
+    InvalidReturnQuantityError,
+    MissingSourceDocumentError,
+    ConversionValidationError
+)
+from backend.services.logger import AuditLoggerService, PerformanceLogger
+
+from backend.models import Operation
 from backend.operations.stock import FIFOStockManager
 from backend.services.validators import DocumentValidator
 from backend.services.logger import AuditLoggerService
@@ -16,9 +26,13 @@ from settlements.services.auto_money_service import AutoMoneyDocumentService
 
 
 class BaseDocumentService:
-    def __init__(self, document):
+    def __init__(self, document, request=None):
         self.document = document
-        self.logger = AuditLoggerService(document=document)
+        # Створюємо розширений logger
+        if request:
+            self.logger = AuditLoggerService.create_from_request(request, document=document)
+        else:
+            self.logger = AuditLoggerService(document=document)
 
     def post(self):
         raise NotImplementedError("Method `post` must be implemented.")
@@ -28,78 +42,142 @@ class BaseDocumentService:
 
 # 🧾 Вираховує ПДВ на рівні DocumentItem
 
-def apply_vat(item, mode="from_price_without_vat"):
-    vat = Decimal(item.vat_percent or 0)
+def apply_vat(item, mode="from_price_with_vat"):
+    """
+    ВИПРАВЛЕНА функція застосування ПДВ
+    mode:
+    - "from_price_with_vat" - ціна включає ПДВ (розділяємо)
+    - "from_price_without_vat" - ціна без ПДВ (додаємо ПДВ)
+    """
+    from backend.models import AccountingSettings
+
+    # Перевіряємо тип фірми
+    firm = item.document.firm
+
+    # ФОП не платить ПДВ
+    if firm.vat_type == 'ФОП':
+        item.vat_percent = 0
+        item.vat_amount = 0
+        item.price_without_vat = item.price
+        item.price_with_vat = item.price
+        item.save(update_fields=["price_with_vat", "price_without_vat", "vat_amount", "vat_percent"])
+        return
+
+    # ТОВ/ТЗОВ/ПАТ платять ПДВ
+    if item.vat_percent is not None:
+        vat_rate = Decimal(item.vat_percent)
+    else:
+        try:
+            settings = AccountingSettings.objects.get(company=item.document.company)
+            vat_rate = settings.default_vat_rate
+            item.vat_percent = vat_rate
+        except AccountingSettings.DoesNotExist:
+            vat_rate = Decimal(20)
+            item.vat_percent = vat_rate
+
     price = Decimal(item.price)
 
     if mode == "from_price_with_vat":
+        # Ціна ВКЛЮЧАЄ ПДВ - розділяємо
         item.price_with_vat = price
-        item.vat_amount = round(price * vat / (100 + vat), 2)
+        item.vat_amount = round(price * vat_rate / (100 + vat_rate), 2)
         item.price_without_vat = round(price - item.vat_amount, 2)
     else:
+        # Ціна БЕЗ ПДВ - додаємо ПДВ
         item.price_without_vat = price
-        item.vat_amount = round(price * vat / 100, 2)
+        item.vat_amount = round(price * vat_rate / 100, 2)
         item.price_with_vat = round(price + item.vat_amount, 2)
 
     item.save(update_fields=["price_with_vat", "price_without_vat", "vat_amount", "vat_percent"])
 
 
-
-
 class ReceiptService(BaseDocumentService):
     def post(self):
-        if self.document.status == 'posted':
-            self.logger.log_event("already_posted", f"Спроба повторного проведення документа {self.document.doc_number}")
-            raise ValidationError("Документ вже проведено.")
+        try:
+            if self.document.status == 'posted':
+                self.logger.log_business_logic_error(
+                    "receipt_already_posted",
+                    "Спроба повторного проведення документа",
+                    {"doc_number": self.document.doc_number, "current_status": self.document.status}
+                )
+                raise DocumentAlreadyPostedException()
 
-        DocumentValidator(self.document).check_can_post()
+            DocumentValidator(self.document).check_can_post()
 
-        # ✅ Перевірка на передоплату
-        if self.document.contract and self.document.contract.contract_type == 'Оплата наперед':
-            raise ValidationError("Передоплата обовʼязкова згідно з умовами договору.")
+            # ✅ Перевірка на передоплату
+            if self.document.contract and self.document.contract.contract_type == 'Оплата наперед':
+                self.logger.log_business_logic_error(
+                    "prepayment_required",
+                    "Передоплата обов'язкова згідно з умовами договору",
+                    {"contract_id": self.document.contract.id,
+                     "contract_type": self.document.contract.contract_type}
+                )
+                raise ValidationError("Передоплата обовʼязкова згідно з умовами договору.")
 
-        for item in self.document.items.all():
-            converted_qty = convert_to_base(item.product, item.unit, item.quantity)
-            item.converted_quantity = converted_qty
+            for item in self.document.items.all():
+                converted_qty = convert_to_base(item.product, item.unit, item.quantity)
+                item.converted_quantity = converted_qty
 
-            if item.price_with_vat and not item.vat_amount:
-                apply_vat(item, mode="from_price_with_vat")
-            else:
-                apply_vat(item)
+                if item.price_with_vat and not item.vat_amount:
+                    apply_vat(item, mode="from_price_with_vat")
+                else:
+                    apply_vat(item)
 
-            item.save(update_fields=["converted_quantity"])
+                item.save(update_fields=["converted_quantity"])
 
-            Operation.objects.create(
-                document=self.document,
-                product=item.product,
-                quantity=converted_qty,
-                price=item.price,
-                warehouse=self.document.warehouse,
-                direction='in',
-                visible=True
-            )
-            self.logger.log_event("receipt_item_posted", f"Надходження: {item.product.name} x {item.quantity}")
+                # ⬇️ НОВА ЛОГІКА: собівартість = ціна закупки
+                Operation.objects.create(
+                    document=self.document,
+                    product=item.product,
+                    quantity=converted_qty,
+                    cost_price=item.price_without_vat,  # ⬅️ Собівартість = ціна закупки без ПДВ
+                    price=item.price_without_vat,       # ⬅️ Для сумісності
+                    warehouse=self.document.warehouse,
+                    direction='in',
+                    visible=True
+                )
+                self.logger.log_event("receipt_item_posted",
+                    f"Надходження: {item.product.name} x {item.quantity} по собівартості {item.price_without_vat}")
 
-        self.document.status = 'posted'
-        self.document.save()
-        self.logger.log_event("receipt_posted", f"Документ {self.document.doc_number} проведено")
+            self.document.status = 'posted'
+            self.document.save()
+            self.logger.log_event("receipt_posted", f"Документ {self.document.doc_number} проведено")
 
-        AutoMoneyDocumentService.create_from_document(self.document)
+            AutoMoneyDocumentService.create_from_document(self.document)
+
+        except Exception as e:
+            self.logger.log_error("receipt_posting_failed", e, {
+                "doc_id": self.document.id,
+                "doc_number": self.document.doc_number,
+                "items_count": self.document.items.count()
+            })
+            raise
 
     def unpost(self):
-        if self.document.status != 'posted':
-            self.logger.log_event("not_posted", f"Спроба розпроведення не проведеного документа {self.document.doc_number}")
-            raise ValidationError("Документ ще не проведено, тому розпровести неможливо.")
+        try:
+            if self.document.status != 'posted':
+                self.logger.log_business_logic_error(
+                    "document_not_posted",
+                    "Спроба розпроведення не проведеного документа",
+                    {"doc_number": self.document.doc_number, "current_status": self.document.status}
+                )
+                raise DocumentNotPostedException()
 
-        DocumentValidator(self.document).check_can_unpost()
+            DocumentValidator(self.document).check_can_unpost()
 
-        Operation.objects.filter(document=self.document).delete()
-        self.logger.log_event("receipt_unposted", f"Операції документа {self.document.doc_number} видалені")
+            Operation.objects.filter(document=self.document).delete()
+            self.logger.log_event("receipt_unposted", f"Операції документа {self.document.doc_number} видалені")
 
-        self.document.status = 'draft'
-        self.document.save()
-        self.logger.log_event("receipt_draft", f"Документ {self.document.doc_number} переведено в чернетку")
+            self.document.status = 'draft'
+            self.document.save()
+            self.logger.log_event("receipt_draft", f"Документ {self.document.doc_number} переведено в чернетку")
 
+        except Exception as e:
+            self.logger.log_error("receipt_unposting_failed", e, {
+                "doc_id": self.document.id,
+                "doc_number": self.document.doc_number
+            })
+            raise
 
 
 class ReturnToSupplierService(BaseDocumentService):
@@ -107,13 +185,13 @@ class ReturnToSupplierService(BaseDocumentService):
         if self.document.status == 'posted':
             self.logger.log_event("already_posted",
                                   f"Спроба повторного проведення документа {self.document.doc_number}")
-            raise ValidationError("Документ вже проведено.")
+            raise DocumentAlreadyPostedException()
 
         DocumentValidator(self.document).check_can_post()
 
         source = self.document.source_document
         if not source or source.doc_type != 'receipt':
-            raise ValidationError("Потрібно вказати дійсний документ Поступлення як джерело повернення.")
+            raise MissingSourceDocumentError("Потрібно вказати дійсний документ Поступлення як джерело повернення.")
 
         for item in self.document.items.all():
             converted_qty = convert_to_base(item.product, item.unit, item.quantity)
@@ -138,9 +216,9 @@ class ReturnToSupplierService(BaseDocumentService):
             max_returnable = total_received - total_returned
 
             if item.quantity > max_returnable:
-                raise ValidationError([
+                raise InvalidReturnQuantityError(
                     f"Повернення '{item.product.name}' перевищує доступну кількість. Отримано: {total_received}, повернуто: {total_returned}, дозволено: {max_returnable}."
-                ])
+                )
 
             Operation.objects.create(
                 document=self.document,
@@ -159,7 +237,7 @@ class ReturnToSupplierService(BaseDocumentService):
 
     def unpost(self):
         if self.document.status != 'posted':
-            raise ValidationError("Документ ще не проведено, тому розпровести неможливо.")
+            raise DocumentNotPostedException()
 
         DocumentValidator(self.document).check_can_unpost()
 
@@ -176,7 +254,7 @@ class TransferService(BaseDocumentService):
         if self.document.status == 'posted':
             self.logger.log_event("already_posted",
                                   f"Спроба повторного проведення документа {self.document.doc_number}")
-            raise ValidationError("Документ вже проведено.")
+            raise DocumentAlreadyPostedException()
 
         DocumentValidator(self.document).check_can_post()
         target_warehouse = self.document.target_warehouse
@@ -188,7 +266,7 @@ class TransferService(BaseDocumentService):
                 firm=self.document.firm  # ⬅️ додано
             )
             if stock < item.quantity:
-                raise ValidationError(
+                raise InsufficientStockError(
                     f"Недостатньо залишку для переміщення: {item.product.name}. Є: {stock}, потрібно: {item.quantity}"
                 )
 
@@ -224,7 +302,7 @@ class TransferService(BaseDocumentService):
 
     def unpost(self):
         if self.document.status != 'posted':
-            raise ValidationError("Документ ще не проведено, тому розпровести неможливо.")
+            raise DocumentNotPostedException()
 
         DocumentValidator(self.document).check_can_unpost()
         Operation.objects.filter(document=self.document).delete()
@@ -233,13 +311,12 @@ class TransferService(BaseDocumentService):
         self.logger.log_event("transfer_unposted", f"Документ {self.document.doc_number} розпроведено")
 
 
-
 class SaleService(BaseDocumentService):
     def post(self):
         if self.document.status == 'posted':
             self.logger.log_event("already_posted",
                                   f"Спроба повторного проведення документа {self.document.doc_number}")
-            raise ValidationError("Документ вже проведено.")
+            raise DocumentAlreadyPostedException()
 
         DocumentValidator(self.document).check_can_post()
 
@@ -254,13 +331,22 @@ class SaleService(BaseDocumentService):
 
             item.save(update_fields=["converted_quantity"])
 
-            FIFOStockManager.sell_fifo(
+            # ⬇️ НОВА ЛОГІКА: FIFO з роздільними цінами
+            total_cost = FIFOStockManager.sell_fifo(
                 document=self.document,
                 product=item.product,
                 warehouse=self.document.warehouse,
                 quantity=converted_qty,
+                sale_price=item.price_without_vat  # ⬅️ Передаємо ціну продажу
             )
-            self.logger.log_event("sale_item", f"Реалізовано {item.product.name} x {item.quantity}")
+
+            # Рахуємо прибуток
+            total_sale = item.price_without_vat * converted_qty
+            profit = total_sale - total_cost
+
+            self.logger.log_event("sale_item",
+                                  f"Реалізовано {item.product.name} x {item.quantity}. "
+                                  f"Продажі: {total_sale}, Собівартість: {total_cost}, Прибуток: {profit}")
 
         self.document.status = 'posted'
         self.document.save()
@@ -329,14 +415,14 @@ class ReturnFromClientService(BaseDocumentService):
         if self.document.status == 'posted':
             self.logger.log_event("already_posted",
                                   f"Спроба повторного проведення документа {self.document.doc_number}")
-            raise ValidationError("Документ вже проведено.")
+            raise DocumentAlreadyPostedException()
 
         DocumentValidator(self.document).check_can_post()
 
         source = self.document.source_document
 
         if not source or source.doc_type != 'sale':
-            raise ValidationError("Потрібно вказати документ реалізації, з якого клієнт повертає товар.")
+            raise MissingSourceDocumentError("Потрібно вказати документ реалізації, з якого клієнт повертає товар.")
 
         for item in self.document.items.all():
             converted_qty = convert_to_base(item.product, item.unit, item.quantity)
@@ -346,7 +432,7 @@ class ReturnFromClientService(BaseDocumentService):
 
             source_item = source.items.filter(product=item.product).first()
             if not source_item:
-                raise ValidationError([f"Товар '{item.product.name}' відсутній у документі реалізації."])
+                raise ValidationError(f"Товар '{item.product.name}' відсутній у документі реалізації.")
 
             total_returned = Operation.objects.filter(
                 document__doc_type='return_from_client',
@@ -358,11 +444,11 @@ class ReturnFromClientService(BaseDocumentService):
             max_returnable = source_item.quantity - total_returned
 
             if item.quantity > max_returnable:
-                raise ValidationError([
+                raise InvalidReturnQuantityError(
                     f"Повернення '{item.product.name}' перевищує реалізовану кількість. "
                     f"Продано: {source_item.quantity}, вже повернуто: {total_returned}, "
                     f"дозволено: {max_returnable}."
-                ])
+                )
 
             Operation.objects.create(
                 document=self.document,
@@ -381,7 +467,7 @@ class ReturnFromClientService(BaseDocumentService):
 
     def unpost(self):
         if self.document.status != 'posted':
-            raise ValidationError("Документ ще не проведено, тому розпровести неможливо.")
+            raise DocumentNotPostedException()
 
         DocumentValidator(self.document).check_can_unpost()
 
@@ -396,7 +482,7 @@ class InventoryService(BaseDocumentService):
         if self.document.status == 'posted':
             self.logger.log_event("already_posted",
                                   f"Спроба повторного проведення документа {self.document.doc_number}")
-            raise ValidationError("Документ вже проведено.")
+            raise DocumentAlreadyPostedException()
 
         DocumentValidator(self.document).check_can_post()
 
@@ -449,7 +535,7 @@ class InventoryService(BaseDocumentService):
 
     def unpost(self):
         if self.document.status != 'posted':
-            raise ValidationError("Документ ще не проведено, тому розпровести неможливо.")
+            raise DocumentNotPostedException()
 
         DocumentValidator(self.document).check_can_unpost()
 
@@ -467,7 +553,7 @@ class StockInDocumentService:
 
     def post(self):
         if self.document.status == 'posted':
-            raise ValidationError("Документ вже проведений.")
+            raise DocumentAlreadyPostedException()
 
         with transaction.atomic():
             for item in self.document.items.all():
@@ -511,21 +597,171 @@ class StockInDocumentService:
             self.document.save()
 
 
-class ConversionDocumentService:
-    def __init__(self, document):
-        self.document = document
+class ConversionDocumentService(BaseDocumentService):
+    def post(self):
+        if self.document.status == 'posted':
+            self.logger.log_event("already_posted",
+                                  f"Спроба повторного проведення документа {self.document.doc_number}")
+            raise DocumentAlreadyPostedException()
+
+        DocumentValidator(self.document).check_can_post()
+
+        # ✅ Валідація наявності source і target товарів
+        source_items = self.document.items.filter(role='source')
+        target_items = self.document.items.filter(role='target')
+
+        if not source_items.exists():
+            raise ConversionValidationError("Документ фасування повинен містити хоча б один товар-джерело (source)")
+
+        if not target_items.exists():
+            raise ConversionValidationError("Документ фасування повинен містити хоча б один товар-результат (target)")
+
+        # ✅ Перевірка залишків для source товарів
+        for item in source_items:
+            converted_qty = convert_to_base(item.product, item.unit, item.quantity)
+            stock = FIFOStockManager.get_available_stock(
+                product=item.product,
+                warehouse=self.document.warehouse,
+                firm=self.document.firm
+            )
+            if stock < converted_qty:
+                raise InsufficientStockError(
+                    f"Недостатньо залишку для фасування товару '{item.product.name}'. "
+                    f"Є: {stock}, потрібно: {converted_qty}"
+                )
+
+        with transaction.atomic():
+            # ⬇️ НОВА ЛОГІКА ФАСУВАННЯ З СОБІВАРТІСТЮ
+            total_source_cost = Decimal('0')
+            total_target_quantity = Decimal('0')
+
+            # 1️⃣ Спочатку рахуємо загальну собівартість source товарів
+            for item in source_items:
+                converted_qty = convert_to_base(item.product, item.unit, item.quantity)
+
+                # Отримуємо собівартість для цієї кількості
+                item_cost = FIFOStockManager.get_cost_price_for_quantity(
+                    item.product, self.document.warehouse, self.document.firm, converted_qty
+                )
+
+                total_source_cost += item_cost * converted_qty
+
+                self.logger.log_event("conversion_source_calculated",
+                                      f"Source товар {item.product.name}: кількість {converted_qty}, собівартість {item_cost}")
+
+            # 2️⃣ Рахуємо загальну кількість target товарів
+            for item in target_items:
+                converted_qty = convert_to_base(item.product, item.unit, item.quantity)
+                total_target_quantity += converted_qty
+
+            # 3️⃣ Розраховуємо собівартість одиниці target товару
+            if total_target_quantity > 0:
+                target_unit_cost = total_source_cost / total_target_quantity
+            else:
+                raise ConversionValidationError("Загальна кількість target товарів не може бути 0")
+
+            # 4️⃣ Списуємо source товари по FIFO
+            for item in source_items:
+                converted_qty = convert_to_base(item.product, item.unit, item.quantity)
+                apply_vat(item)
+                item.converted_quantity = converted_qty
+                item.save(update_fields=["converted_quantity"])
+
+                # Списуємо через FIFO (створює операції списання)
+                FIFOStockManager.sell_fifo(
+                    document=self.document,
+                    product=item.product,
+                    warehouse=self.document.warehouse,
+                    quantity=converted_qty
+                )
+
+            # 5️⃣ Оприбутковуємо target товари з розрахованою собівартістю
+            for item in target_items:
+                converted_qty = convert_to_base(item.product, item.unit, item.quantity)
+                apply_vat(item)
+                item.converted_quantity = converted_qty
+                item.save(update_fields=["converted_quantity"])
+
+                Operation.objects.create(
+                    document=self.document,
+                    product=item.product,
+                    quantity=converted_qty,
+                    cost_price=target_unit_cost,  # ⬅️ Розрахована собівартість
+                    price=target_unit_cost,  # ⬅️ Для сумісності
+                    warehouse=self.document.warehouse,
+                    direction='in',
+                    visible=True
+                )
+
+            self.document.status = 'posted'
+            self.document.save()
+
+            self.logger.log_event("conversion_posted",
+                                  f"Фасування {self.document.doc_number} проведено. "
+                                  f"Загальна собівартість source: {total_source_cost}, "
+                                  f"Собівартість одиниці target: {target_unit_cost}")
+
+    def unpost(self):
+        if self.document.status != 'posted':
+            raise DocumentNotPostedException()
+
+        DocumentValidator(self.document).check_can_unpost()
+        Operation.objects.filter(document=self.document).delete()
+        self.document.status = 'draft'
+        self.document.save()
+        self.logger.log_event("conversion_unposted", f"Фасування {self.document.doc_number} розпроведено")
+
+
+class InventoryInService(BaseDocumentService):
+    """Сервіс оприбуткування товарів"""
 
     def post(self):
+        if self.document.status == 'posted':
+            self.logger.log_event("already_posted",
+                                  f"Спроба повторного проведення документа {self.document.doc_number}")
+            raise DocumentAlreadyPostedException()
+
+        DocumentValidator(self.document).check_can_post()
+
         for item in self.document.items.all():
-            direction = 'out' if item.role == 'input' else 'in'
+            converted_qty = convert_to_base(item.product, item.unit, item.quantity)
+
+            if item.price_with_vat and not item.vat_amount:
+                apply_vat(item, mode="from_price_with_vat")
+            else:
+                apply_vat(item)
+
+            item.converted_quantity = converted_qty
+            item.save(update_fields=["converted_quantity"])
+
+            # Створюємо операцію оприбуткування
             Operation.objects.create(
                 document=self.document,
                 product=item.product,
-                quantity=item.quantity,
-                price=item.price,
                 warehouse=self.document.warehouse,
-                direction=direction,
-                visible=True,
+                direction='in',
+                quantity=converted_qty,
+                cost_price=item.price_without_vat or item.price,
+                total_cost=(item.price_without_vat or item.price) * converted_qty,
+                price=item.price_without_vat or item.price,  # Для сумісності
+                visible=True
             )
+
+            self.logger.log_event("inventory_in_item",
+                                  f"Оприбуткування: {item.product.name} x {item.quantity} по собівартості {item.price_without_vat or item.price}")
+
         self.document.status = 'posted'
         self.document.save()
+        self.logger.log_event("inventory_in_posted", f"Документ {self.document.doc_number} проведено")
+
+    def unpost(self):
+        if self.document.status != 'posted':
+            raise DocumentNotPostedException()
+
+        DocumentValidator(self.document).check_can_unpost()
+
+        Operation.objects.filter(document=self.document).delete()
+
+        self.document.status = 'draft'
+        self.document.save()
+        self.logger.log_event("inventory_in_unposted", f"Документ {self.document.doc_number} розпроведено")

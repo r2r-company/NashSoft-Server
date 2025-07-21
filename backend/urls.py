@@ -6,17 +6,19 @@ from backend.views import (
     CreatePriceSettingDocumentView, PriceSettingDocumentListView, stock_report, WhoAmIView,
     CustomLoginView, DocumentDetailView, ProductListView, ProductDetailView, CompanyListView,
     WarehouseListView, CustomerListCreateView, SupplierListCreateView, ProductGroupTreeView,
-    StockInActionView, UserListView, UnitListView, PaymentTypeListCreateView, FirmListView,
-    DepartmentListView, AccountListView, TechCalculationAPIView, ProductGroupFlatView, CustomerTypeListView,
-    PriceTypeListView, AppUserListView, CompanyDetailView, FirmDetailView, VatTypeChoicesView,
+    StockInActionView, UserListView, PaymentTypeListCreateView,
+    DepartmentListView, AccountListView, TechCalculationAPIView, ProductGroupFlatView,
+    PriceTypeListView, CompanyDetailView, FirmDetailView, VatTypeChoicesView,
     FirmListCreateView, WarehouseDetailView, WarehouseListCreateView, DepartmentDetailView, ProductGroupDetailView,
     ProductGroupListCreateView, UnitListCreateView, UnitDetailView, SupplierDetailView, CustomerDetailView,
     CustomerTypeListCreateView, CustomerTypeDetailView, AccountDetailView, PriceTypeListCreateView, PriceTypeDetailView,
     AppUserListCreateView, AppUserDetailView, InterfaceListCreateView, InterfaceDetailView, ProductTotalStockView,
-    TradePointListCreateView, TradePointDetailView, ReceiptProductsView
+    TradePointListCreateView, TradePointDetailView, ReceiptProductsView, ProductUnitConversionDetailView,
+    ProductUnitConversionListCreateView, ProductConversionsByProductIdView, ConversionActionView, StockValueReportView,
+    ProfitabilityReportView, inventory_in_action
 )
 from kkm.service.kkm.shift import ShiftStatusView, OpenShiftView, CloseShiftView
-from kkm.views import PrintReceiptView, PrintMultiFirmReceiptsView
+from kkm.views import PrintMultiFirmReceiptsView
 from settlements.views import CreateManualPaymentView, MoneyDocumentActionView, PaySupplierDebtView
 from vchasno_kasa.views import VchasnoSystemTaskView
 
@@ -117,4 +119,13 @@ urlpatterns = [
     path('trade-points/', TradePointListCreateView.as_view(), name='trade_point_list_create'),
     path('trade-points/<int:pk>/', TradePointDetailView.as_view(), name='trade_point_detail'),
     path("receipt-products/", ReceiptProductsView.as_view()),
+    path("unit-conversions/", ProductUnitConversionListCreateView.as_view(), name="unit_conversion_list_create"),
+    path("unit-conversions/<int:pk>/", ProductUnitConversionDetailView.as_view(), name="unit_conversion_detail"),
+    path("unit-conversions/by-product/<int:product_id>/", ProductConversionsByProductIdView.as_view(),
+         name="unit_conversions_by_product"),
+    path('conversion/', ConversionActionView.as_view(), name='conversion_action'),
+    path('reports/profitability/', ProfitabilityReportView.as_view()),
+    path('reports/stock-value/', StockValueReportView.as_view()),
+    path('inventory_in/', inventory_in_action),
+
 ]

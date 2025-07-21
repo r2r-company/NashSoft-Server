@@ -1,7 +1,9 @@
+import documents
 from django.contrib.auth import get_user_model
 from django.core.exceptions import ValidationError
 from django.shortcuts import  render
 from django.views.decorators.csrf import csrf_exempt
+from rest_framework.decorators import api_view
 from rest_framework.exceptions import NotFound
 from rest_framework.generics import ListAPIView, RetrieveAPIView, ListCreateAPIView, RetrieveUpdateAPIView, \
     RetrieveUpdateDestroyAPIView
@@ -13,31 +15,38 @@ from django.db.models import Sum, Case, When, Value, DecimalField, F
 from backend.auth import CustomLoginSerializer
 from backend.models import Operation, Document, PriceSettingDocument, AppUser, Product, Company, \
     Warehouse, Customer, Supplier, ProductGroup, Unit, PaymentType, Firm, Department, CustomerType, PriceType, \
-    Interface, TradePoint
+    Interface, TradePoint, ProductUnitConversion
 from backend.serializers import DocumentSerializer, DocumentListSerializer, PriceSettingDocumentSerializer, \
     ProductSerializer, CompanySerializer, WarehouseSerializer, CustomerSerializer, SupplierSerializer, \
     ProductGroupSerializer, PaymentTypeSerializer, FirmSerializer, DepartmentSerializer, AccountSerializer, \
     TechCalculationSerializer, ProductGroupFlatSerializer, CustomerTypeSerializer, PriceTypeSerializer, \
-    InterfaceSerializer, UnitSerializer, AppUserSerializer, TradePointSerializer
+    InterfaceSerializer, UnitSerializer, AppUserSerializer, TradePointSerializer, ProductUnitConversionSerializer
+from backend.services.document_services import SaleService, ReceiptService, InventoryInService
 from backend.services.factory import get_document_service
 from backend.services.logger import AuditLoggerService
 from backend.services.tech_calc import TechCalculationService
+from backend.utils.responses import StandardResponse, DocumentActionResponse
 from settlements.models import Account
 
 
 class DocumentPostView(APIView):
     permission_classes = [AllowAny]
 
-    # @require_document_permission("receipt", "create")  # Для Поступлення (Receipt) перевіряється право на створення
     def post(self, request):
         serializer = DocumentSerializer(data=request.data)
         if serializer.is_valid():
             document = serializer.save()
-            return Response(
-                {"message": f"Документ {document.doc_number} створено. ID: {document.id}"},
-                status=201
+            return StandardResponse.created(
+                data=DocumentSerializer(document).data,
+                message=f"Документ {document.doc_number} створено успішно",
+                resource_id=document.id
             )
-        return Response(serializer.errors, status=400)
+
+        return StandardResponse.error(
+            message="Помилка створення документа",
+            details=serializer.errors,
+            error_code="VALIDATION_ERROR"
+        )
 
 
 class DocumentListView(APIView):
@@ -50,8 +59,13 @@ class DocumentListView(APIView):
         if doc_type:
             queryset = queryset.filter(doc_type=doc_type)
 
-        serializer = DocumentListSerializer(queryset, many=True)
-        return Response(serializer.data)
+        return StandardResponse.paginated(
+            queryset=queryset,  # ⬅️ ВИПРАВИТИ ТУТ!
+            request=request,
+            serializer_class=DocumentListSerializer,
+            page_size=20,
+            message="Список документів отримано"
+        )
 
 
 class DocumentDetailView(APIView):
@@ -195,38 +209,47 @@ class DocumentActionGetView(APIView):
 
 
 class TransferActionView(APIView):
+    permission_classes = [AllowAny]
+
     def get(self, request):
         doc_id = request.query_params.get("id")
         action = request.query_params.get("action")
 
         if not doc_id:
-            return Response({"error": "Не передано параметр 'id'"}, status=400)
+            return StandardResponse.error("Не передано параметр 'id'", "MISSING_PARAMETER")
 
         try:
-            document = Document.objects.get(id=int(doc_id))  # якщо id — число
+            document = Document.objects.get(id=int(doc_id))
         except Document.DoesNotExist:
-            return Response({"error": "Документ не знайдено"}, status=404)
+            return StandardResponse.not_found("Документ", "document")
         except ValueError:
-            return Response({"error": "Невалідний формат ID"}, status=400)
+            return StandardResponse.error("Невалідний формат ID", "INVALID_ID")
 
         if document.doc_type != 'transfer':
-            return Response({"error": "Це не документ переміщення"}, status=400)
+            return StandardResponse.error("Це не документ переміщення", "INVALID_DOCUMENT_TYPE")
 
         service = get_document_service(document)
 
+        # Додаємо логування через middleware
+        logger = AuditLoggerService.create_from_request(request, document=document)
+
         try:
             if action == "progress":
+                logger.log_event("transfer_action_requested", f"Запит на проведення переміщення {document.doc_number}")
                 service.post()
-                return Response({"message": f"Документ {document.doc_number} проведено"}, status=200)
+                return DocumentActionResponse.posted(document.doc_number, "Переміщення")
 
             if action == "unpost":
+                logger.log_event("transfer_unpost_requested",
+                                 f"Запит на розпроведення переміщення {document.doc_number}")
                 service.unpost()
-                return Response({"message": f"Документ {document.doc_number} розпроведено"}, status=200)
+                return DocumentActionResponse.unposted(document.doc_number, "Переміщення")
 
-            return Response({"error": "Невідома дія"}, status=400)
+            return StandardResponse.error("Невідома дія", "UNKNOWN_ACTION")
 
-        except ValidationError as e:
-            return Response({"error": e.messages}, status=400)
+        except Exception as e:
+            logger.log_error("transfer_action_failed", e, {"action": action, "doc_id": doc_id})
+            return StandardResponse.error(str(e), "SERVICE_ERROR")
 
 
 class ReturnToSupplierActionView(APIView):
@@ -300,37 +323,76 @@ class ReturnFromClientActionView(APIView):
 
 
 class SaleActionView(APIView):
+    permission_classes = [AllowAny]
+
     def get(self, request):
         doc_id = request.query_params.get("id")
         action = request.query_params.get("action")
 
         if not doc_id:
-            return Response({"error": "Не передано параметр 'id'"}, status=400)
+            return StandardResponse.error("Не передано параметр 'id'", "MISSING_PARAMETER")
 
         try:
             document = Document.objects.get(id=int(doc_id))
         except Document.DoesNotExist:
-            return Response({"error": "Документ не знайдено"}, status=404)
+            return StandardResponse.not_found("Документ", "document")
+        except ValueError:
+            return StandardResponse.error("Невалідний формат ID", "INVALID_ID")
 
         if document.doc_type != 'sale':
-            return Response({"error": "Це не документ реалізації"}, status=400)
+            return StandardResponse.error("Це не документ продажу", "INVALID_DOCUMENT_TYPE")
 
-        service = get_document_service(document)
+        # ⬇️ ДОДАЙТЕ request ТУТ
+        service = SaleService(document, request=request)
 
         try:
             if action == "progress":
                 service.post()
-                return Response({"message": f"Документ {document.doc_number} проведено"}, status=200)
+                return DocumentActionResponse.posted(document.doc_number, "Реалізація")
 
             if action == "unpost":
                 service.unpost()
-                return Response({"message": f"Документ {document.doc_number} розпроведено"}, status=200)
+                return DocumentActionResponse.unposted(document.doc_number, "Реалізація")
 
-            return Response({"error": "Невідома дія"}, status=400)
+            return StandardResponse.error("Невідома дія", "UNKNOWN_ACTION")
 
-        except ValidationError as e:
-            return Response({"error": e.messages}, status=400)
+        except Exception as e:
+            return StandardResponse.error(str(e), "SERVICE_ERROR")
 
+
+class ReceiptActionView(APIView):
+    permission_classes = [AllowAny]
+
+    def get(self, request):
+        doc_id = request.query_params.get("id")
+        action = request.query_params.get("action")
+
+        if not doc_id:
+            return StandardResponse.error("Не передано параметр 'id'", "MISSING_PARAMETER")
+
+        try:
+            document = Document.objects.get(id=int(doc_id))
+        except Document.DoesNotExist:
+            return StandardResponse.not_found("Документ", "document")
+
+        if document.doc_type != 'receipt':
+            return StandardResponse.error("Це не документ поступлення", "INVALID_DOCUMENT_TYPE")
+
+        service = ReceiptService(document, request=request)
+
+        try:
+            if action == "progress":
+                service.post()
+                return DocumentActionResponse.posted(document.doc_number, "Поступлення")
+
+            if action == "unpost":
+                service.unpost()
+                return DocumentActionResponse.unposted(document.doc_number, "Поступлення")
+
+            return StandardResponse.error("Невідома дія", "UNKNOWN_ACTION")
+
+        except Exception as e:
+            return StandardResponse.error(str(e), "SERVICE_ERROR")
 
 class InventoryActionView(APIView):
     def get(self, request):
@@ -401,18 +463,17 @@ class StockInActionView(APIView):
 
 
 class PriceSettingDocumentActionView(APIView):
+    permission_classes = [AllowAny]
     def get(self, request):
         action = request.query_params.get('action')
-        doc_number = request.query_params.get('id')
+        doc_id = request.query_params.get('id')
 
-        if not action or not doc_number:
+        if not action or not doc_id:
             raise ValidationError("Не вказано параметри action або id.")
 
         try:
-            # Замість id використовуємо doc_number для пошуку документа
-            document = PriceSettingDocument.objects.get(doc_number=doc_number)
+            document = PriceSettingDocument.objects.get(id=doc_id)
         except PriceSettingDocument.DoesNotExist:
-            # Якщо документ не знайдений, повертаємо 404
             return Response({"error": "Документ ціноутворення не знайдено."}, status=status.HTTP_404_NOT_FOUND)
 
         if action == 'approve':
@@ -478,7 +539,8 @@ class CreatePriceSettingDocumentView(APIView):
         if serializer.is_valid():
             price_setting_document = serializer.save()  # Створення документа з елементами
             return Response({
-                "message": f"Документ ціноутворення {price_setting_document.doc_number} створено."
+                "message": f"Документ ціноутворення {price_setting_document.doc_number} створено.",
+                "id": price_setting_document.id
             }, status=201)
 
         return Response(serializer.errors, status=400)
@@ -1144,3 +1206,237 @@ class ReceiptProductsView(APIView):
             })
 
         return Response(result)
+
+
+class ProductUnitConversionListCreateView(ListCreateAPIView):
+    queryset = ProductUnitConversion.objects.all()
+    serializer_class = ProductUnitConversionSerializer
+    permission_classes = [AllowAny]
+
+class ProductUnitConversionDetailView(RetrieveUpdateDestroyAPIView):
+    queryset = ProductUnitConversion.objects.all()
+    serializer_class = ProductUnitConversionSerializer
+    permission_classes = [AllowAny]
+
+class ProductConversionsByProductIdView(APIView):
+    permission_classes = [AllowAny]
+
+    def get(self, request, product_id):
+        conversions = ProductUnitConversion.objects.filter(product_id=product_id)
+        serializer = ProductUnitConversionSerializer(conversions, many=True)
+        return Response(serializer.data)
+
+
+class ConversionActionView(APIView):
+    permission_classes = [AllowAny]
+
+    def get(self, request):
+        doc_id = request.query_params.get("id")
+        action = request.query_params.get("action")
+
+        if not doc_id:
+            return StandardResponse.error("Не передано параметр 'id'", "MISSING_PARAMETER")
+
+        try:
+            document = Document.objects.get(id=int(doc_id))
+        except Document.DoesNotExist:
+            return StandardResponse.not_found("Документ", "document")
+
+        if document.doc_type != 'conversion':
+            return StandardResponse.error("Це не документ фасування", "INVALID_DOCUMENT_TYPE")
+
+        service = get_document_service(document)
+        logger = AuditLoggerService.create_from_request(request, document=document)
+
+        try:
+            if action == "progress":
+                logger.log_event("conversion_action_requested", f"Запит на проведення фасування {document.doc_number}")
+                service.post()
+                return DocumentActionResponse.posted(document.doc_number, "Фасування")
+
+            if action == "unpost":
+                logger.log_event("conversion_unpost_requested", f"Запит на розпроведення фасування {document.doc_number}")
+                service.unpost()
+                return DocumentActionResponse.unposted(document.doc_number, "Фасування")
+
+            return StandardResponse.error("Невідома дія", "UNKNOWN_ACTION")
+
+        except Exception as e:
+            logger.log_error("conversion_action_failed", e, {"action": action, "doc_id": doc_id})
+            return StandardResponse.error(str(e), "SERVICE_ERROR")
+
+
+class ProfitabilityReportView(APIView):
+    permission_classes = [AllowAny]
+
+    def get(self, request):
+        """Звіт по прибутковості товарів"""
+        date_from = request.query_params.get('date_from')
+        date_to = request.query_params.get('date_to')
+        product_id = request.query_params.get('product_id')
+        warehouse_id = request.query_params.get('warehouse_id')
+
+        # Операції продажів
+        sales_ops = Operation.objects.filter(
+            direction='out',
+            document__doc_type='sale',
+            sale_price__isnull=False
+        ).select_related('product', 'warehouse', 'document')
+
+        if date_from:
+            sales_ops = sales_ops.filter(created_at__gte=date_from)
+        if date_to:
+            sales_ops = sales_ops.filter(created_at__lte=date_to)
+        if product_id:
+            sales_ops = sales_ops.filter(product_id=product_id)
+        if warehouse_id:
+            sales_ops = sales_ops.filter(warehouse_id=warehouse_id)
+
+        # Агрегація по товарах
+        report_data = []
+
+        products = Product.objects.filter(
+            id__in=sales_ops.values_list('product_id', flat=True)
+        ).distinct()
+
+        for product in products:
+            product_ops = sales_ops.filter(product=product)
+
+            total_quantity = product_ops.aggregate(
+                total=Sum('quantity')
+            )['total'] or 0
+
+            total_cost = product_ops.aggregate(
+                total=Sum('total_cost')
+            )['total'] or 0
+
+            total_sale = product_ops.aggregate(
+                total=Sum('total_sale')
+            )['total'] or 0
+
+            profit = total_sale - total_cost
+            margin = (profit / total_sale * 100) if total_sale > 0 else 0
+
+            report_data.append({
+                'product_id': product.id,
+                'product_name': product.name,
+                'quantity_sold': float(total_quantity),
+                'total_cost': float(total_cost),
+                'total_revenue': float(total_sale),
+                'profit': float(profit),
+                'margin_percent': round(float(margin), 2),
+                'avg_cost_price': float(total_cost / total_quantity) if total_quantity > 0 else 0,
+                'avg_sale_price': float(total_sale / total_quantity) if total_quantity > 0 else 0,
+            })
+
+        # Сортування по прибутку
+        report_data.sort(key=lambda x: x['profit'], reverse=True)
+
+        # Загальна статистика
+        totals = {
+            'total_products': len(report_data),
+            'total_quantity': sum(item['quantity_sold'] for item in report_data),
+            'total_cost': sum(item['total_cost'] for item in report_data),
+            'total_revenue': sum(item['total_revenue'] for item in report_data),
+            'total_profit': sum(item['profit'] for item in report_data),
+        }
+
+        if totals['total_revenue'] > 0:
+            totals['overall_margin'] = round(totals['total_profit'] / totals['total_revenue'] * 100, 2)
+        else:
+            totals['overall_margin'] = 0
+
+        return StandardResponse.success({
+            'items': report_data,
+            'totals': totals
+        }, "Звіт по прибутковості сформовано")
+
+
+class StockValueReportView(APIView):
+    permission_classes = [AllowAny]
+
+    def get(self, request):
+        """Звіт по вартості залишків"""
+        from backend.operations.stock import FIFOStockManager
+
+        warehouse_id = request.query_params.get('warehouse_id')
+        firm_id = request.query_params.get('firm_id')
+
+        if not firm_id:
+            return StandardResponse.error("Потрібно вказати firm_id")
+
+        firm = Firm.objects.get(id=firm_id)
+
+        warehouses = Warehouse.objects.all()
+        if warehouse_id:
+            warehouses = warehouses.filter(id=warehouse_id)
+
+        report_data = []
+
+        for warehouse in warehouses:
+            # Всі товари що є на складі
+            products_with_stock = Operation.objects.filter(
+                warehouse=warehouse,
+                document__firm=firm,
+                direction='in',
+                visible=True
+            ).values_list('product_id', flat=True).distinct()
+
+            warehouse_data = {
+                'warehouse_id': warehouse.id,
+                'warehouse_name': warehouse.name,
+                'products': [],
+                'total_value': 0
+            }
+
+            for product_id in products_with_stock:
+                product = Product.objects.get(id=product_id)
+
+                stock = FIFOStockManager.get_available_stock(product, warehouse, firm)
+                if stock > 0:
+                    value = FIFOStockManager.get_stock_value(product, warehouse, firm)
+                    avg_cost = value / stock if stock > 0 else 0
+
+                    warehouse_data['products'].append({
+                        'product_id': product.id,
+                        'product_name': product.name,
+                        'quantity': float(stock),
+                        'avg_cost_price': float(avg_cost),
+                        'total_value': float(value)
+                    })
+
+                    warehouse_data['total_value'] += float(value)
+
+            if warehouse_data['products']:
+                report_data.append(warehouse_data)
+
+        total_value = sum(w['total_value'] for w in report_data)
+
+        return StandardResponse.success({
+            'warehouses': report_data,
+            'total_value': total_value
+        }, "Звіт по вартості залишків сформовано")
+
+
+@api_view(['GET'])
+def inventory_in_action(request):
+    """Проведення оприбуткування"""
+    doc_id = request.query_params.get('id')
+    action = request.query_params.get('action')
+
+    try:
+        document = Document.objects.get(id=doc_id, doc_type='inventory_in')
+
+        if action == 'progress':
+            InventoryInService(document).post()
+            return StandardResponse.success(
+                {"doc_number": document.doc_number},
+                "Оприбуткування проведено успішно"
+            )
+
+        return StandardResponse.error("Невідома дія")
+
+    except Document.DoesNotExist:
+        return StandardResponse.error("Документ не знайдено")
+    except Exception as e:
+        return StandardResponse.error(f"Помилка: {e}")
