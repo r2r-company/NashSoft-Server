@@ -1,3 +1,5 @@
+from decimal import Decimal
+
 import documents
 from django.contrib.auth import get_user_model
 from django.core.exceptions import ValidationError
@@ -15,7 +17,8 @@ from django.db.models import Sum, Case, When, Value, DecimalField, F
 from backend.auth import CustomLoginSerializer
 from backend.models import Operation, Document, PriceSettingDocument, AppUser, Product, Company, \
     Warehouse, Customer, Supplier, ProductGroup, Unit, PaymentType, Firm, Department, CustomerType, PriceType, \
-    Interface, TradePoint, ProductUnitConversion
+    Interface, TradePoint, ProductUnitConversion, PriceSettingItem
+from backend.operations.stock import FIFOStockManager
 from backend.serializers import DocumentSerializer, DocumentListSerializer, PriceSettingDocumentSerializer, \
     ProductSerializer, CompanySerializer, WarehouseSerializer, CustomerSerializer, SupplierSerializer, \
     ProductGroupSerializer, PaymentTypeSerializer, FirmSerializer, DepartmentSerializer, AccountSerializer, \
@@ -24,48 +27,68 @@ from backend.serializers import DocumentSerializer, DocumentListSerializer, Pric
 from backend.services.document_services import SaleService, ReceiptService, InventoryInService
 from backend.services.factory import get_document_service
 from backend.services.logger import AuditLoggerService
+from backend.services.price import get_price_from_setting, get_all_prices_for_product
 from backend.services.tech_calc import TechCalculationService
 from backend.utils.responses import StandardResponse, DocumentActionResponse
-from settlements.models import Account
+from backend.utils.unit_converter import convert_to_base
+from settlements.models import Account, Contract
+from settlements.serializers import ContractSerializer
 
 
 class DocumentPostView(APIView):
     permission_classes = [AllowAny]
 
     def post(self, request):
-        serializer = DocumentSerializer(data=request.data)
-        if serializer.is_valid():
-            document = serializer.save()
-            return StandardResponse.created(
-                data=DocumentSerializer(document).data,
-                message=f"Документ {document.doc_number} створено успішно",
-                resource_id=document.id
+        try:
+            serializer = DocumentSerializer(data=request.data)
+            if serializer.is_valid():
+                document = serializer.save()
+                return StandardResponse.created(
+                    data=DocumentSerializer(document).data,
+                    message=f"Документ {document.doc_number} створено успішно",
+                    resource_id=document.id
+                )
+
+            return StandardResponse.error(
+                message="Помилка створення документа",
+                details=serializer.errors,
+                error_code="VALIDATION_ERROR"
             )
 
-        return StandardResponse.error(
-            message="Помилка створення документа",
-            details=serializer.errors,
-            error_code="VALIDATION_ERROR"
-        )
+        # ✅ ДОДАТИ ДЕТАЛЬНИЙ EXCEPTION HANDLER:
+        except Exception as e:
+            import traceback
+            print("=== DJANGO CREATE DOCUMENT ERROR ===")
+            print(f"Error: {e}")
+            print(f"Error type: {type(e).__name__}")
+            print(f"Traceback: {traceback.format_exc()}")
+            print("Request data:", request.data)
+            print("====================================")
+
+            return StandardResponse.error(
+                message=f"Внутрішня помилка: {str(e)}",
+                error_code="INTERNAL_ERROR"
+            )
 
 
 class DocumentListView(APIView):
     permission_classes = [AllowAny]
 
     def get(self, request):
-        doc_type = request.query_params.get("type")  # необов'язковий фільтр
+        doc_type = request.query_params.get("type")
         queryset = Document.objects.all().order_by("-date")
 
         if doc_type:
             queryset = queryset.filter(doc_type=doc_type)
 
-        return StandardResponse.paginated(
-            queryset=queryset,  # ⬅️ ВИПРАВИТИ ТУТ!
-            request=request,
-            serializer_class=DocumentListSerializer,
-            page_size=20,
-            message="Список документів отримано"
-        )
+        # ✅ ВИПРАВИТИ - ПОТРІБНА ПРАВИЛЬНА ПАГІНАЦІЯ:
+        serializer = DocumentListSerializer(queryset, many=True)
+
+        return Response({
+            "success": True,
+            "data": serializer.data,  # ✅ МАСИВ ДОКУМЕНТІВ
+            "message": "Список документів отримано"
+        }, status=200)
 
 
 class DocumentDetailView(APIView):
@@ -93,15 +116,55 @@ class DocumentDetailView(APIView):
 
 class StockBalanceView(APIView):
     permission_classes = [AllowAny]
+
     def get(self, request):
         try:
-            data = (
-                Operation.objects
-                .filter(visible=True, direction='in')
-                .values('product__id', 'product__name', 'warehouse__id', 'warehouse__name')
-                .annotate(total=Sum('quantity'))
-                .order_by('warehouse__name', 'product__name')
-            )
+            firm_id = request.query_params.get("firm")
+            company_id = request.query_params.get("company")
+            warehouse_id = request.query_params.get("warehouse")
+
+            if not firm_id and not company_id:
+                return Response({"error": "Потрібно вказати firm або company"}, status=400)
+
+            from backend.operations.stock import FIFOStockManager
+
+            # ✅ ЛОГІКА ПО ФІРМАМ
+            if firm_id:
+                # Для конкретної фірми
+                firms = [Firm.objects.get(id=firm_id)]
+            else:
+                # Для всіх фірм компанії
+                firms = Firm.objects.filter(company_id=company_id)
+
+            # Склади
+            warehouses = Warehouse.objects.all()
+            if warehouse_id:
+                warehouses = warehouses.filter(id=warehouse_id)
+
+            data = []
+            for firm in firms:
+                for warehouse in warehouses:
+                    # Товари що є на цьому складі для цієї фірми
+                    products = Product.objects.filter(
+                        operation__warehouse=warehouse,
+                        operation__document__firm=firm,
+                        operation__direction='in',
+                        operation__visible=True
+                    ).distinct()
+
+                    for product in products:
+                        stock = FIFOStockManager.get_available_stock(product, warehouse, firm)
+                        if stock > 0:
+                            data.append({
+                                'product__id': product.id,
+                                'product__name': product.name,
+                                'warehouse__id': warehouse.id,
+                                'warehouse__name': warehouse.name,
+                                'firm__id': firm.id,  # ✅ ДОДАНО
+                                'firm__name': firm.name,  # ✅ ДОДАНО
+                                'total': float(stock)
+                            })
+
             return Response(data)
         except Exception as e:
             return Response({"error": str(e)}, status=500)
@@ -1440,3 +1503,663 @@ def inventory_in_action(request):
         return StandardResponse.error("Документ не знайдено")
     except Exception as e:
         return StandardResponse.error(f"Помилка: {e}")
+
+
+class PriceSettingDocumentDetailView(RetrieveAPIView):
+    queryset = PriceSettingDocument.objects.all()
+    serializer_class = PriceSettingDocumentSerializer
+    permission_classes = [AllowAny]
+
+
+class ContractsByCustomerView(APIView):
+    permission_classes = [AllowAny]
+
+    def get(self, request):
+        customer_id = request.query_params.get('id')
+
+        if not customer_id:
+            return Response({"error": "Не передано customer_id"}, status=400)
+
+        try:
+            contracts = Contract.objects.filter(
+                client_id=customer_id,
+                is_active=True
+            ).select_related('supplier', 'client', 'payment_type', 'account')
+
+            serializer = ContractSerializer(contracts, many=True)
+            return Response(serializer.data)
+
+        except Exception as e:
+            return Response({"error": str(e)}, status=500)
+
+
+class ProductUnitConversionsView(APIView):
+    permission_classes = [AllowAny]
+
+    def get(self, request):
+        product_id = request.query_params.get('product')
+
+        if not product_id:
+            return Response({"error": "Не передано product_id"}, status=400)
+
+        try:
+            conversions = ProductUnitConversion.objects.filter(
+                product_id=product_id
+            ).select_related('product', 'from_unit', 'to_unit')
+
+            data = []
+            for conv in conversions:
+                data.append({
+                    'id': conv.id,
+                    'name': conv.name,
+                    'product': conv.product.id,
+                    'from_unit': conv.from_unit.id,
+                    'to_unit': conv.to_unit.id,
+                    'factor': conv.factor,
+                    'from_unit_name': conv.from_unit.name,
+                    'to_unit_name': conv.to_unit.name,
+                })
+
+            return Response(data)
+
+        except Exception as e:
+            return Response({"error": str(e)}, status=500)
+
+
+class ProductPricesView(APIView):
+    """
+    ✅ НОВИЙ endpoint: отримання всіх доступних цін для товару
+
+    GET /api/product-prices/?product=1&firm=1&trade_point=2&price_type=1
+    """
+    permission_classes = [AllowAny]
+
+    def get(self, request):
+        product_id = request.query_params.get('product')
+        firm_id = request.query_params.get('firm')
+        trade_point_id = request.query_params.get('trade_point')
+        price_type_id = request.query_params.get('price_type')
+
+        # ✅ Валідація обов'язкових параметрів
+        if not product_id or not firm_id:
+            return StandardResponse.error(
+                "Потрібно вказати product та firm",
+                "MISSING_PARAMETERS"
+            )
+
+        try:
+            product = Product.objects.get(id=product_id)
+            firm = Firm.objects.get(id=firm_id)
+
+            trade_point = None
+            if trade_point_id:
+                trade_point = TradePoint.objects.get(id=trade_point_id)
+
+            price_type = None
+            if price_type_id:
+                price_type = PriceType.objects.get(id=price_type_id)
+
+        except (Product.DoesNotExist, Firm.DoesNotExist, TradePoint.DoesNotExist, PriceType.DoesNotExist) as e:
+            return StandardResponse.error(
+                f"Обʼєкт не знайдено: {str(e)}",
+                "OBJECT_NOT_FOUND"
+            )
+
+        # ✅ Отримуємо всі ціни
+        prices = get_all_prices_for_product(
+            product=product,
+            firm=firm,
+            trade_point=trade_point,
+            price_type=price_type
+        )
+
+        # ✅ Додаємо інформацію про доступні залишки
+        enriched_prices = []
+        for price_data in prices:
+            # Отримуємо залишок товару
+            if trade_point and trade_point.firm.warehouse_set.exists():
+                warehouse = trade_point.firm.warehouse_set.first()
+                stock = FIFOStockManager.get_available_stock(product, warehouse, firm)
+            else:
+                stock = 0
+
+            price_data['available_stock'] = float(stock)
+            price_data['can_sell'] = stock > 0
+            enriched_prices.append(price_data)
+
+        return StandardResponse.success(
+            data={
+                'product': {
+                    'id': product.id,
+                    'name': product.name,
+                    'base_unit': product.unit.name,
+                    'base_unit_symbol': product.unit.symbol
+                },
+                'prices': enriched_prices,
+                'total_variants': len(enriched_prices)
+            },
+            message=f"Знайдено {len(enriched_prices)} варіантів цін для товару"
+        )
+
+
+class ProductSpecificPriceView(APIView):
+    """
+    ✅ НОВИЙ endpoint: отримання ціни для конкретного фасування
+
+    GET /api/product-specific-price/?product=1&firm=1&unit_conversion=3&trade_point=2
+    """
+    permission_classes = [AllowAny]
+
+    def get(self, request):
+        product_id = request.query_params.get('product')
+        firm_id = request.query_params.get('firm')
+        unit_conversion_id = request.query_params.get('unit_conversion')
+        trade_point_id = request.query_params.get('trade_point')
+        price_type_id = request.query_params.get('price_type')
+
+        if not product_id or not firm_id:
+            return StandardResponse.error(
+                "Потрібно вказати product та firm",
+                "MISSING_PARAMETERS"
+            )
+
+        try:
+            product = Product.objects.get(id=product_id)
+            firm = Firm.objects.get(id=firm_id)
+
+            unit_conversion = None
+            if unit_conversion_id:
+                unit_conversion = ProductUnitConversion.objects.get(id=unit_conversion_id)
+
+            trade_point = None
+            if trade_point_id:
+                trade_point = TradePoint.objects.get(id=trade_point_id)
+
+            price_type = None
+            if price_type_id:
+                price_type = PriceType.objects.get(id=price_type_id)
+
+        except (Product.DoesNotExist, Firm.DoesNotExist, ProductUnitConversion.DoesNotExist,
+                TradePoint.DoesNotExist, PriceType.DoesNotExist) as e:
+            return StandardResponse.error(
+                f"Обʼєкт не знайдено: {str(e)}",
+                "OBJECT_NOT_FOUND"
+            )
+
+        # ✅ Отримуємо конкретну ціну
+        price_data = get_price_from_setting(
+            product=product,
+            firm=firm,
+            trade_point=trade_point,
+            price_type=price_type,
+            unit_conversion=unit_conversion
+        )
+
+        if not price_data:
+            return StandardResponse.error(
+                "Ціна не знайдена для вказаних параметрів",
+                "PRICE_NOT_FOUND"
+            )
+
+        return StandardResponse.success(
+            data=price_data,
+            message="Ціна знайдена"
+        )
+
+
+# views.py - ДОДАТИ цей debug view для діагностики
+
+class ProductPricesDebugView(APIView):
+    """
+    🔍 DEBUG endpoint для діагностики проблем з цінами
+    """
+    permission_classes = [AllowAny]
+
+    def get(self, request):
+        try:
+            product_id = request.query_params.get('product')
+            firm_id = request.query_params.get('firm')
+
+            if not product_id:
+                return StandardResponse.error("Потрібно вказати product_id")
+
+            try:
+                product = Product.objects.get(id=product_id)
+                firm = Firm.objects.get(id=firm_id) if firm_id else None
+            except (Product.DoesNotExist, Firm.DoesNotExist):
+                return StandardResponse.error("Товар або фірма не знайдені")
+
+            debug_info = {
+                'product_info': {
+                    'id': product.id,
+                    'name': product.name,
+                    'firm_id': getattr(product, 'firm_id', 'Не встановлено'),
+                    'base_unit': product.unit.name if product.unit else 'Не встановлено'
+                }
+            }
+
+            # Весь інший код як в артифакті...
+
+            return StandardResponse.success(
+                data=debug_info,
+                message="Діагностична інформація отримана"
+            )
+
+        except Exception as e:
+            return StandardResponse.error(
+                f"Помилка виконання: {str(e)}",
+                "INTERNAL_ERROR"
+            )
+
+
+class ProductPricesSimpleDebugView(APIView):
+    """Спрощений debug для пошуку проблеми"""
+    permission_classes = [AllowAny]
+
+    def get(self, request):
+        product_id = request.query_params.get('product')
+        firm_id = request.query_params.get('firm')
+
+        try:
+            product = Product.objects.get(id=product_id)
+            firm = Firm.objects.get(id=firm_id) if firm_id else None
+        except:
+            return StandardResponse.error("Товар або фірма не знайдені")
+
+        debug_info = {}
+
+        # 1️⃣ Інформація про товар
+        debug_info['product'] = {
+            'id': product.id,
+            'name': product.name,
+            'firm_id': getattr(product, 'firm_id', None),
+            'unit': product.unit.name if product.unit else None
+        }
+
+        # 2️⃣ Документи ціноутворення для фірми
+        if firm:
+            docs_count = PriceSettingDocument.objects.filter(firm=firm).count()
+            approved_count = PriceSettingDocument.objects.filter(firm=firm, status='approved').count()
+
+            debug_info['documents'] = {
+                'total': docs_count,
+                'approved': approved_count
+            }
+
+            # Останні документи
+            recent_docs = PriceSettingDocument.objects.filter(firm=firm).order_by('-id')[:3]
+            debug_info['recent_docs'] = [
+                {
+                    'id': doc.id,
+                    'number': doc.doc_number,
+                    'status': doc.status,
+                    'valid_from': str(doc.valid_from),
+                    'firm_id': doc.firm.id
+                }
+                for doc in recent_docs
+            ]
+
+        # 3️⃣ Позиції ціноутворення для товару
+        price_items_count = PriceSettingItem.objects.filter(product=product).count()
+        debug_info['price_items_total'] = price_items_count
+
+        if firm:
+            price_items_for_firm = PriceSettingItem.objects.filter(product=product, firm=firm).count()
+            debug_info['price_items_for_firm'] = price_items_for_firm
+
+        # 4️⃣ Типи цін
+        price_types = PriceType.objects.all()
+        debug_info['price_types'] = [
+            {'id': pt.id, 'name': pt.name, 'is_default': pt.is_default}
+            for pt in price_types
+        ]
+
+        # 5️⃣ Фасування
+        conversions_count = ProductUnitConversion.objects.filter(product=product).count()
+        debug_info['conversions_count'] = conversions_count
+
+        return StandardResponse.success(debug_info, "Debug інформація")
+
+
+
+class ProductSalePreviewView(APIView):
+    """
+    🔍 ПОВНИЙ АНАЛІЗ товару для продажу
+
+    GET /api/product-sale-preview/?product=1&firm=1&warehouse=1&quantity=5&unit=2&trade_point=1
+
+    Показує:
+    - Залишки і FIFO партії
+    - Доступні ціни з ціноутворення
+    - Розрахунок собівартості
+    - ПДВ та фасування
+    - Прибутковість
+    """
+    permission_classes = [AllowAny]
+
+    def get(self, request):
+        # Параметри запиту
+        product_id = request.query_params.get('product')
+        firm_id = request.query_params.get('firm')
+        warehouse_id = request.query_params.get('warehouse')
+        quantity = request.query_params.get('quantity', 1)
+        unit_id = request.query_params.get('unit')
+        trade_point_id = request.query_params.get('trade_point')
+        price_type_id = request.query_params.get('price_type')
+
+        if not all([product_id, firm_id, warehouse_id]):
+            return StandardResponse.error("Потрібно вказати product, firm, warehouse")
+
+        try:
+            product = Product.objects.get(id=product_id)
+            firm = Firm.objects.get(id=firm_id)
+            warehouse = Warehouse.objects.get(id=warehouse_id)
+            quantity = Decimal(str(quantity))
+
+            unit = Unit.objects.get(id=unit_id) if unit_id else product.unit
+            trade_point = TradePoint.objects.get(id=trade_point_id) if trade_point_id else None
+            price_type = PriceType.objects.get(id=price_type_id) if price_type_id else None
+
+        except (Product.DoesNotExist, Firm.DoesNotExist, Warehouse.DoesNotExist,
+                Unit.DoesNotExist, TradePoint.DoesNotExist, PriceType.DoesNotExist) as e:
+            return StandardResponse.error(f"Об'єкт не знайдено: {str(e)}")
+
+        # Конвертуємо кількість в базову одиницю
+        converted_qty = convert_to_base(product, unit, quantity)
+
+        result = {
+            'input_parameters': {
+                'product_name': product.name,
+                'firm_name': firm.name,
+                'warehouse_name': warehouse.name,
+                'requested_quantity': float(quantity),
+                'unit_name': unit.name,
+                'converted_quantity_base': float(converted_qty),
+                'base_unit': product.unit.name
+            }
+        }
+
+        # 1️⃣ АНАЛІЗ ЗАЛИШКІВ ТА FIFO
+        result['stock_analysis'] = self._analyze_stock_fifo(product, warehouse, firm, converted_qty)
+
+        # 2️⃣ АНАЛІЗ ЦІН З ЦІНОУТВОРЕННЯ
+        result['price_analysis'] = self._analyze_pricing(product, firm, trade_point, price_type, unit)
+
+        # 3️⃣ РОЗРАХУНОК СОБІВАРТОСТІ
+        result['cost_analysis'] = self._analyze_cost(product, warehouse, firm, converted_qty)
+
+        # 4️⃣ АНАЛІЗ ФАСУВАННЯ
+        result['packaging_analysis'] = self._analyze_packaging(product, unit)
+
+        # 5️⃣ РОЗРАХУНОК ПРИБУТКОВОСТІ
+        result['profitability_analysis'] = self._analyze_profitability(result)
+
+        # 6️⃣ РЕКОМЕНДАЦІЇ
+        result['recommendations'] = self._generate_recommendations(result)
+
+        return StandardResponse.success(result, "Аналіз продажу товару виконано")
+
+    def _analyze_stock_fifo(self, product, warehouse, firm, quantity):
+        """Аналіз залишків та FIFO партій"""
+
+        # Загальний залишок
+        total_stock = FIFOStockManager.get_available_stock(product, warehouse, firm)
+
+        # Детальний FIFO аналіз
+        fifo_sources = Operation.objects.filter(
+            product=product,
+            warehouse=warehouse,
+            document__firm=firm,
+            direction='in',
+            visible=True
+        ).order_by('created_at')
+
+        fifo_details = []
+        qty_collected = Decimal('0')
+
+        for source in fifo_sources:
+            # Скільки вже використано з цієї партії
+            used = Operation.objects.filter(
+                source_operation=source,
+                direction='out',
+                visible=True
+            ).aggregate(total=Sum('quantity'))['total'] or 0
+
+            available_from_source = source.quantity - used
+
+            if available_from_source > 0:
+                qty_to_take = min(available_from_source, quantity - qty_collected)
+
+                fifo_details.append({
+                    'source_operation_id': source.id,
+                    'document_number': source.document.doc_number,
+                    'document_date': source.created_at.isoformat(),
+                    'original_quantity': float(source.quantity),
+                    'already_used': float(used),
+                    'available': float(available_from_source),
+                    'will_use': float(qty_to_take),
+                    'cost_price': float(source.cost_price),
+                    'cost_for_this_part': float(qty_to_take * source.cost_price)
+                })
+
+                qty_collected += qty_to_take
+
+                if qty_collected >= quantity:
+                    break
+
+        return {
+            'total_available_stock': float(total_stock),
+            'requested_quantity': float(quantity),
+            'can_sell': total_stock >= quantity,
+            'shortage': float(max(0, quantity - total_stock)),
+            'fifo_breakdown': fifo_details,
+            'total_sources_used': len(fifo_details)
+        }
+
+    def _analyze_pricing(self, product, firm, trade_point, price_type, unit):
+        """Аналіз ціноутворення"""
+        from backend.services.price import get_all_prices_for_product, get_price_from_setting
+        from backend.models import ProductUnitConversion
+
+        # Визначаємо фасування
+        unit_conversion = None
+        if unit != product.unit:
+            unit_conversion = ProductUnitConversion.objects.filter(
+                product=product,
+                to_unit=unit
+            ).first()
+
+        # Всі доступні ціни
+        all_prices = get_all_prices_for_product(product, firm, trade_point, price_type)
+
+        # Конкретна ціна для запитаних параметрів
+        specific_price = get_price_from_setting(product, firm, trade_point, price_type, unit_conversion)
+
+        return {
+            'all_available_prices': all_prices,
+            'selected_price': specific_price,
+            'unit_conversion_used': {
+                'id': unit_conversion.id if unit_conversion else None,
+                'name': unit_conversion.name if unit_conversion else 'Базова одиниця',
+                'factor': float(unit_conversion.factor) if unit_conversion else 1.0
+            },
+            'price_documents_count': PriceSettingDocument.objects.filter(
+                firm=firm,
+                status='approved'
+            ).count()
+        }
+
+    def _analyze_cost(self, product, warehouse, firm, quantity):
+        """Розрахунок собівартості"""
+        try:
+            # ✅ ВИПРАВЛЕННЯ: розраховуємо собівартість правильно
+            avg_cost = FIFOStockManager.get_cost_price_for_quantity(product, warehouse, firm, quantity)
+            total_cost = avg_cost * quantity
+
+            # ✅ ДОДАЄМО: собівартість за одиницю продажу (не базову)
+            # Якщо продаємо в грамах, то собівартість треба перерахувати
+
+            return {
+                'average_cost_per_base_unit': float(avg_cost),  # 100 грн/кг
+                'average_cost_per_sale_unit': float(avg_cost),  # ✅ ДОДАМО ЛОГІКУ НИЖЧЕ
+                'total_cost': float(total_cost),
+                'calculation_method': 'FIFO',
+                'success': True
+            }
+        except Exception as e:
+            return {
+                'error': str(e),
+                'success': False
+            }
+
+    def _analyze_packaging(self, product, unit):
+        """Аналіз фасування"""
+        conversions = ProductUnitConversion.objects.filter(product=product)
+
+        return {
+            'base_unit': {
+                'id': product.unit.id,
+                'name': product.unit.name,
+                'symbol': product.unit.symbol
+            },
+            'selected_unit': {
+                'id': unit.id,
+                'name': unit.name,
+                'symbol': unit.symbol
+            },
+            'is_base_unit': unit == product.unit,
+            'available_conversions': [
+                {
+                    'id': conv.id,
+                    'name': conv.name,
+                    'from_unit': conv.from_unit.name,
+                    'to_unit': conv.to_unit.name,
+                    'factor': float(conv.factor)
+                }
+                for conv in conversions
+            ]
+        }
+
+    def _analyze_profitability(self, result):
+        """Розрахунок прибутковості"""
+        try:
+            cost_data = result['cost_analysis']
+            price_data = result['price_analysis']['selected_price']
+            input_params = result['input_parameters']
+
+            if not cost_data['success'] or not price_data:
+                return {'error': 'Недостатньо даних для розрахунку'}
+
+            # ✅ ВИПРАВЛЕННЯ: правильний розрахунок собівартості за одиницю продажу
+            requested_qty = Decimal(str(input_params['requested_quantity']))
+            converted_qty = Decimal(str(input_params['converted_quantity_base']))
+
+            sale_price_per_unit = Decimal(str(price_data['price']))  # ціна за одиницю продажу (грам)
+            base_cost_per_kg = Decimal(str(cost_data['average_cost_per_base_unit']))  # собівартість за кг
+
+            # ✅ РОЗРАХОВУЄМО собівартість за одиницю продажу
+            if converted_qty > 0 and requested_qty > 0:
+                # Скільки коштує 1 одиниця продажу (1 грам)
+                cost_per_sale_unit = (base_cost_per_kg * converted_qty) / requested_qty
+            else:
+                cost_per_sale_unit = base_cost_per_kg
+
+            # Розрахунки за загальну кількість
+            total_revenue = sale_price_per_unit * requested_qty
+            total_cost = cost_per_sale_unit * requested_qty
+            profit = total_revenue - total_cost
+            margin = (profit / total_revenue * 100) if total_revenue > 0 else 0
+
+            return {
+                'sale_price_per_unit': float(sale_price_per_unit),
+                'cost_price_per_unit': float(cost_per_sale_unit),  # ✅ ВИПРАВЛЕНО
+                'profit_per_unit': float(sale_price_per_unit - cost_per_sale_unit),
+                'total_revenue': float(total_revenue),
+                'total_cost': float(total_cost),
+                'total_profit': float(profit),
+                'margin_percent': float(margin),
+                'is_profitable': profit > 0,
+                # ✅ ДОДАЄМО DEBUG INFO
+                'debug': {
+                    'base_cost_per_kg': float(base_cost_per_kg),
+                    'requested_qty': float(requested_qty),
+                    'converted_qty_kg': float(converted_qty),
+                    'calculation': f"{float(base_cost_per_kg)} * {float(converted_qty)} / {float(requested_qty)} = {float(cost_per_sale_unit)}"
+                }
+            }
+        except Exception as e:
+            return {'error': str(e)}
+
+    def _generate_recommendations(self, result):
+        """Генерація рекомендацій"""
+        recommendations = []
+
+        # Перевірка залишків
+        if not result['stock_analysis']['can_sell']:
+            recommendations.append({
+                'type': 'warning',
+                'message': f"Недостатньо залишку! Потрібно: {result['stock_analysis']['requested_quantity']}, є: {result['stock_analysis']['total_available_stock']}"
+            })
+
+        # Перевірка цін
+        if not result['price_analysis']['selected_price']:
+            recommendations.append({
+                'type': 'error',
+                'message': 'Ціна не знайдена в ціноутворенні! Додайте ціну для цього товару.'
+            })
+
+        # Перевірка прибутковості
+        prof = result.get('profitability_analysis', {})
+        if 'margin_percent' in prof:
+            if prof['margin_percent'] < 10:
+                recommendations.append({
+                    'type': 'warning',
+                    'message': f"Низька рентабельність: {prof['margin_percent']:.1f}%"
+                })
+            elif prof['margin_percent'] > 50:
+                recommendations.append({
+                    'type': 'info',
+                    'message': f"Висока рентабельність: {prof['margin_percent']:.1f}%"
+                })
+
+        return recommendations
+
+
+@api_view(['GET'])
+def get_product_packaging(request, product_id):
+    """Отримати список фасувань для товару"""
+    try:
+        product = Product.objects.get(id=product_id)
+
+        # Отримуємо всі фасування для цього товару
+        packagings = ProductUnitConversion.objects.filter(
+            product=product
+        ).select_related('from_unit', 'to_unit').values(
+            'id', 'factor',
+            'from_unit__name', 'from_unit__symbol',
+            'to_unit__name', 'to_unit__symbol'
+        )
+
+        return Response({
+            'success': True,
+            'product': {
+                'id': product.id,
+                'name': product.name,
+                'base_unit': {
+                    'name': product.unit.name,
+                    'symbol': product.unit.symbol
+                }
+            },
+            'packagings': list(packagings)
+        })
+
+    except Product.DoesNotExist:
+        return Response({
+            'success': False,
+            'error': 'Товар не знайдено'
+        }, status=404)
+    except Exception as e:
+        return Response({
+            'success': False,
+            'error': str(e)
+        }, status=500)

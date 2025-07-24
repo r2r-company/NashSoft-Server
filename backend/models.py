@@ -130,11 +130,16 @@ class Product(models.Model):
         ('ingredient', 'Інгредієнт'),
     ]
     name = models.CharField(_('Назва товару'), max_length=255)
-    unit = models.ForeignKey(Unit, on_delete=models.SET_NULL, null=True, verbose_name=_('Одиниця виміру'))
+    unit = models.ForeignKey(Unit, on_delete=models.SET_NULL, null=True,
+                             verbose_name=_('Базова одиниця виміру'))  # ✅ ДОДАВ "БАЗОВА"
     group = models.ForeignKey('ProductGroup', null=True, blank=True, on_delete=models.SET_NULL,
                               verbose_name=_('Група товару'))
     firm = models.ForeignKey("Firm", on_delete=models.CASCADE, verbose_name="Фірма-власник")
     type = models.CharField(_('Тип'), max_length=20, choices=PRODUCT_TYPES, default='product')
+
+    # ✅ ДОДАТИ ЦІ ПОЛЯ:
+    base_price = models.DecimalField(_('Базова ціна'), max_digits=10, decimal_places=2, null=True, blank=True,
+                                     help_text="Ціна за базову одиницю виміру")
 
     def __str__(self):
         return self.name
@@ -159,34 +164,68 @@ class ProductCalculation(models.Model):
 
 
 class ProductCalculationItem(models.Model):
-    calculation = models.ForeignKey(ProductCalculation, on_delete=models.CASCADE, related_name='items',
-                                    verbose_name='Калькуляція')
-    component = models.ForeignKey(Product, on_delete=models.CASCADE,
-                                  verbose_name='Компонент (інгредієнт або напівфабрикат)')
-    quantity = models.DecimalField(_('Кількість'), max_digits=10, decimal_places=3)
-    loss_percent = models.DecimalField(_('Втрати при обробці (%)'), max_digits=5, decimal_places=2, default=0)
-    cooking_loss_percent = models.DecimalField(_('Втрати при термообробці (%)'), max_digits=5, decimal_places=2,
-                                               default=0)
-    note = models.CharField(_('Примітка'), max_length=255, blank=True, null=True)
+    calculation = models.ForeignKey(ProductCalculation, on_delete=models.CASCADE, related_name='items')
+    component = models.ForeignKey(Product, on_delete=models.CASCADE, verbose_name="Компонент")
+    quantity = models.DecimalField(max_digits=10, decimal_places=3, verbose_name="Кількість")
+    loss_percent = models.DecimalField(max_digits=5, decimal_places=2, default=0, verbose_name="Відходи %")
+    cooking_loss_percent = models.DecimalField(max_digits=5, decimal_places=2, default=0,
+                                               verbose_name="Втрати при готуванні %")
+    note = models.TextField(blank=True, null=True, verbose_name="Примітка")
+
+    # ✅ НОВЕ ПОЛЕ ДЛЯ ФАСУВАННЯ:
+    unit_conversion = models.ForeignKey(
+        'ProductUnitConversion',
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        verbose_name="Фасування",
+        help_text="Оберіть фасування або залиште пустим для базової одиниці"
+    )
 
     class Meta:
-        verbose_name = 'Компонент калькуляції'
-        verbose_name_plural = 'Компоненти калькуляції'
+        verbose_name = "Позиція калькуляції"
+        verbose_name_plural = "Позиції калькуляції"
 
     def __str__(self):
-        return f"{self.component.name} x {self.quantity}"
+        if self.unit_conversion:
+            return f"{self.component.name} - {self.quantity} {self.unit_conversion.to_unit.name}"
+        else:
+            return f"{self.component.name} - {self.quantity} {self.component.unit.name}"
+
+    def get_base_quantity(self):
+        """Отримати кількість в базових одиницях"""
+        if self.unit_conversion:
+            # Якщо обрано фасування - конвертуємо в базові одиниці
+            return self.quantity * self.unit_conversion.factor
+        else:
+            # Якщо базова одиниця
+            return self.quantity
+
+    def get_display_unit(self):
+        """Отримати одиницю для відображення"""
+        if self.unit_conversion:
+            return self.unit_conversion.to_unit
+        else:
+            return self.component.unit
 
 
 class ProductUnitConversion(models.Model):
     product = models.ForeignKey(Product, on_delete=models.CASCADE, verbose_name="Товар")
-    from_unit = models.ForeignKey(Unit, on_delete=models.CASCADE, related_name="from_conversions", verbose_name="З од.")
-    to_unit = models.ForeignKey(Unit, on_delete=models.CASCADE, related_name="to_conversions", verbose_name="В од.")
-    factor = models.DecimalField(max_digits=10, decimal_places=4, verbose_name="Фактор конвертації")
+    name = models.CharField("Назва фасування", max_length=100, help_text="Пакет 100г, Упаковка 2кг")
+    from_unit = models.ForeignKey(Unit, on_delete=models.CASCADE, related_name="from_conversions",
+                                  verbose_name="Базова од.")
+    to_unit = models.ForeignKey(Unit, on_delete=models.CASCADE, related_name="to_conversions",
+                                verbose_name="Од. фасування")
+    factor = models.DecimalField("Коефіцієнт", max_digits=10, decimal_places=4,
+                                 help_text="Скільки базових одиниць в одному фасуванні")
 
     class Meta:
-        unique_together = ('product', 'from_unit', 'to_unit')
-        verbose_name = "Конвертація одиниць"
-        verbose_name_plural = "Конвертації одиниць"
+        unique_together = ('product', 'name')
+        verbose_name = "Фасування товару"
+        verbose_name_plural = "Фасування товарів"
+
+    def __str__(self):
+        return f"{self.product.name}: {self.name}"
 
 
 class CustomerType(models.Model):
@@ -336,6 +375,11 @@ class Document(models.Model):
         ('inventory', _('Інвентаризація')),
         ('stock_in', _('Оприбуткування')),
         ('conversion', 'Фасування'),
+        ('production_order', 'Виробниче замовлення'),
+        ('production', 'Виробництво'),
+        ('production_plan', 'План виробництва'),
+        ('work_order', 'Робоче завдання'),
+        ('quality_control', 'Контроль якості'),
 
     ]
     doc_type = models.CharField(_('Тип документа'), max_length=30, choices=DOC_TYPES)
@@ -512,6 +556,8 @@ class DocumentItem(models.Model):
     product = models.ForeignKey(Product, on_delete=models.CASCADE, verbose_name=_('Товар'))
     quantity = models.DecimalField(_('Кількість'), max_digits=10, decimal_places=2)
     unit = models.ForeignKey(Unit, on_delete=models.PROTECT, verbose_name='Одиниця виміру')
+    unit_conversion = models.ForeignKey(ProductUnitConversion, on_delete=models.SET_NULL, null=True, blank=True,
+                                        verbose_name='Фасування')  # ✅ ДОДАТИ ЦЕ ПОЛЕ
     price = models.DecimalField(_('Ціна'), max_digits=10, decimal_places=2)
     discount = models.DecimalField(_('Знижка (%)'), max_digits=5, decimal_places=2, default=0)
     final_price = models.DecimalField(_('Ціна з урахуванням знижки'), max_digits=10, decimal_places=2, null=True,
@@ -682,37 +728,126 @@ class PriceSettingDocument(models.Model):
         super().save(*args, **kwargs)
 
 
+# models.py - ВИПРАВЛЕНА частина PriceSettingItem
+
 class PriceSettingItem(models.Model):
     price_setting_document = models.ForeignKey(PriceSettingDocument, on_delete=models.CASCADE, related_name='items')
     product = models.ForeignKey(Product, on_delete=models.CASCADE)
     price_type = models.ForeignKey(PriceType, on_delete=models.CASCADE, default=1)
-    price = models.DecimalField(max_digits=12, decimal_places=2)
 
-    vat_included = models.BooleanField(default=True)
+    # ✅ НОВА ЛОГІКА ЦІН:
+    price = models.DecimalField("Ціна продажу", max_digits=12, decimal_places=2,
+                                help_text="Фінальна ціна за одиницю (з урахуванням фасування)")
+
+    vat_included = models.BooleanField(default=True, verbose_name="ПДВ включено в ціну")
     vat_percent = models.DecimalField(max_digits=5, decimal_places=2, default=20.00)
-    markup_percent = models.DecimalField(max_digits=5, decimal_places=2, default=0.00)
-    price_without_vat = models.DecimalField(max_digits=12, decimal_places=2, default=0)
-    vat_amount = models.DecimalField(max_digits=12, decimal_places=2, default=0)
+    markup_percent = models.DecimalField("Націнка %", max_digits=5, decimal_places=2, default=0.00)
+
+    # ✅ РОЗРАХОВАНІ ПОЛЯ ПДВ:
+    price_without_vat = models.DecimalField("Ціна без ПДВ", max_digits=12, decimal_places=2, default=0)
+    vat_amount = models.DecimalField("Сума ПДВ", max_digits=12, decimal_places=2, default=0)
+
     source_item = models.ForeignKey('DocumentItem', on_delete=models.SET_NULL, null=True, blank=True)
     trade_point = models.ForeignKey(TradePoint, on_delete=models.CASCADE)
     firm = models.ForeignKey(Firm, on_delete=models.CASCADE, null=True, blank=True)
-    unit = models.ForeignKey(Unit, on_delete=models.PROTECT, verbose_name="Одиниця ціни", null=True, blank=True)
-    unit_conversion = models.ForeignKey(ProductUnitConversion, on_delete=models.PROTECT, null=True, blank=True)
 
-    def calculate_price(self):
+    # ✅ ФАСУВАННЯ:
+    unit_conversion = models.ForeignKey(
+        ProductUnitConversion,
+        on_delete=models.PROTECT,
+        null=True,
+        blank=True,
+        verbose_name="Фасування",
+        help_text="Якщо не вказано - ціна за базову одиницю"
+    )
+
+    # ✅ АВТОМАТИЧНО РОЗРАХОВУЄТЬСЯ:
+    unit = models.ForeignKey(
+        Unit,
+        on_delete=models.PROTECT,
+        verbose_name="Одиниця ціни",
+        null=True,
+        blank=True,
+        help_text="Автоматично: базова одиниця або одиниця фасування"
+    )
+
+    def save(self, *args, **kwargs):
+        """Автоматично визначаємо одиницю та розраховуємо ПДВ"""
+
+        # ✅ 1. ВИЗНАЧАЄМО ОДИНИЦЮ:
+        if self.unit_conversion:
+            # Якщо є фасування - одиниця з фасування
+            self.unit = self.unit_conversion.to_unit
+        else:
+            # Якщо без фасування - базова одиниця товару
+            self.unit = self.product.unit
+
+        # ✅ 2. РОЗРАХОВУЄМО ПДВ:
+        self._calculate_vat()
+
+        super().save(*args, **kwargs)
+
+    def _calculate_vat(self):
+        """Розрахунок ПДВ"""
         if not self.vat_percent:
-            self.vat_percent = self.product.vat_rate or 0
+            # Автопідстановка ПДВ залежно від типу фірми
+            if self.firm and self.firm.is_vat_payer:
+                self.vat_percent = 20
+            else:
+                self.vat_percent = 0
 
-        if self.vat_included:
+        if self.vat_included and self.vat_percent > 0:
+            # Ціна ВКЛЮЧАЄ ПДВ - витягуємо ПДВ
             self.price_without_vat = round(self.price / (1 + self.vat_percent / 100), 2)
             self.vat_amount = round(self.price - self.price_without_vat, 2)
         else:
+            # Ціна БЕЗ ПДВ або ПДВ = 0
             self.price_without_vat = self.price
-            self.vat_amount = round(self.price * self.vat_percent / 100, 2)
-            self.price = self.price_without_vat + self.vat_amount
+            if self.vat_percent > 0:
+                self.vat_amount = round(self.price * self.vat_percent / 100, 2)
+            else:
+                self.vat_amount = 0
+
+    def get_base_price(self):
+        """Розрахувати ціну за базову одиницю товару"""
+        if self.unit_conversion:
+            # Якщо є фасування - перераховуємо в базову ціну
+            return round(self.price / self.unit_conversion.factor, 2)
+        else:
+            # Якщо без фасування - ціна вже за базову одиницю
+            return self.price
+
+    def get_package_info(self):
+        """Отримати інформацію про фасування для відображення"""
+        if self.unit_conversion:
+            return {
+                'is_packaged': True,
+                'package_name': self.unit_conversion.name,
+                'package_unit': self.unit_conversion.to_unit.symbol,
+                'base_unit': self.product.unit.symbol,  # ✅ ЗАВЖДИ базова одиниця ТОВАРУ
+                'factor': float(self.unit_conversion.factor),
+                'price_per_package': float(self.price),
+                'price_per_base_unit': float(self.get_base_price())
+            }
+        else:
+            return {
+                'is_packaged': False,
+                'package_name': 'Базова одиниця',
+                'package_unit': self.product.unit.symbol,
+                'base_unit': self.product.unit.symbol,
+                'factor': 1.0,
+                'price_per_package': float(self.price),
+                'price_per_base_unit': float(self.price)
+            }
+
+    def __str__(self):
+        package_info = self.get_package_info()
+        return f"{self.product.name} ({package_info['package_name']}) - {self.price} грн/{package_info['package_unit']}"
 
     class Meta:
-        unique_together = ('price_setting_document', 'product', 'price_type', 'trade_point')
+        unique_together = ('price_setting_document', 'product', 'price_type', 'trade_point', 'unit_conversion')
+        verbose_name = "Позиція ціноутворення"
+        verbose_name_plural = "Позиції ціноутворення"
 
 
 User = get_user_model()

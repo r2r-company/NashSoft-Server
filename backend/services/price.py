@@ -8,7 +8,20 @@ from backend.models import PriceSettingDocument, PriceSettingItem, PriceType, Pr
 from django.utils.timezone import now
 
 
-def get_price_from_setting(product, firm, trade_point, price_type=None):
+def get_price_from_setting(product, firm, trade_point=None, price_type=None, unit_conversion=None):
+    """
+    ✅ ОНОВЛЕНА функція отримання ціни з урахуванням фасування
+
+    Args:
+        product: Товар
+        firm: Фірма
+        trade_point: Торгова точка (опціонально)
+        price_type: Тип ціни (якщо не вказано - беремо дефолтний)
+        unit_conversion: Конкретне фасування (опціонально)
+
+    Returns:
+        dict з інформацією про ціну або None
+    """
     from backend.models import AccountingSettings
 
     today = now().date()
@@ -27,40 +40,162 @@ def get_price_from_setting(product, firm, trade_point, price_type=None):
     if not price_type:
         return None
 
+    # Отримуємо актуальні документи ціноутворення
     docs = (
         PriceSettingDocument.objects
-        .filter(status='approved', valid_from__lte=today, company=firm.company)
+        .filter(status='approved', valid_from__lte=today, firm=firm)
         .order_by('-valid_from')
     )
 
-    # 1️⃣ Перевага: ціна для конкретної торгової точки + фірма
+    # ✅ ПОШУК З УРАХУВАННЯМ ФАСУВАННЯ:
+    base_query_filters = {
+        'product': product,
+        'price_type': price_type,
+        'firm': firm
+    }
+
+    # 1️⃣ Якщо запитується конкретне фасування
+    if unit_conversion:
+        # Шукаємо точну ціну для цього фасування
+        for doc in docs:
+            if trade_point:
+                # Спочатку для конкретної торгової точки
+                item = PriceSettingItem.objects.filter(
+                    price_setting_document=doc,
+                    trade_point=trade_point,
+                    unit_conversion=unit_conversion,
+                    **base_query_filters
+                ).first()
+                if item:
+                    return _build_price_result(item)
+
+            # Потім для всіх торгових точок
+            item = PriceSettingItem.objects.filter(
+                price_setting_document=doc,
+                trade_point__isnull=True,
+                unit_conversion=unit_conversion,
+                **base_query_filters
+            ).first()
+            if item:
+                return _build_price_result(item)
+
+    # 2️⃣ Пошук для торгової точки (будь-яке фасування)
     if trade_point:
         for doc in docs.filter(trade_points=trade_point):
             item = PriceSettingItem.objects.filter(
                 price_setting_document=doc,
-                product=product,
-                price_type=price_type,
                 trade_point=trade_point,
-                firm=firm
+                **base_query_filters
             ).first()
             if item:
-                return item.price
+                return _build_price_result(item)
 
-    # 2️⃣ Фолбек: ціна по фірмі (на всі торгові точки)
+    # 3️⃣ Фолбек: ціна по фірмі (базова одиниця)
     for doc in docs:
         item = PriceSettingItem.objects.filter(
             price_setting_document=doc,
-            product=product,
-            price_type=price_type,
             trade_point__isnull=True,
-            firm=firm
+            unit_conversion__isnull=True,  # Базова одиниця
+            **base_query_filters
         ).first()
         if item:
-            return item.price
+            return _build_price_result(item)
 
     return None
 
 
+def get_all_prices_for_product(product, firm, trade_point=None, price_type=None):
+    """
+    ✅ НОВА функція: отримати ВСІ доступні ціни для товару (всі фасування)
+
+    Returns:
+        list з усіма варіантами цін для товару
+    """
+    from backend.models import AccountingSettings
+
+    today = now().date()
+
+    # Визначаємо тип ціни
+    if not price_type:
+        try:
+            settings = AccountingSettings.objects.get(company=firm.company)
+            price_type = settings.default_price_type or PriceType.objects.filter(is_default=True).first()
+        except AccountingSettings.DoesNotExist:
+            price_type = PriceType.objects.filter(is_default=True).first()
+
+    if not price_type:
+        return []
+
+    # Отримуємо актуальні документи
+    docs = (
+        PriceSettingDocument.objects
+        .filter(status='approved', valid_from__lte=today, firm=firm)
+        .order_by('-valid_from')
+    )
+
+    prices = []
+    seen_conversions = set()  # Щоб не дублювати фасування
+
+    base_query_filters = {
+        'product': product,
+        'price_type': price_type,
+        'firm': firm
+    }
+
+    # Шукаємо всі ціни для цього товару
+    for doc in docs:
+        query = PriceSettingItem.objects.filter(
+            price_setting_document=doc,
+            **base_query_filters
+        )
+
+        if trade_point:
+            query = query.filter(Q(trade_point=trade_point) | Q(trade_point__isnull=True))
+
+        items = query.all()
+
+        for item in items:
+            # Унікальний ключ для фасування
+            conversion_key = item.unit_conversion.id if item.unit_conversion else 'base'
+
+            if conversion_key not in seen_conversions:
+                prices.append(_build_price_result(item))
+                seen_conversions.add(conversion_key)
+
+    return prices
+
+
+def _build_price_result(price_item):
+    """
+    ✅ Допоміжна функція: формує результат з інформацією про ціну
+    """
+    package_info = price_item.get_package_info()
+
+    return {
+        'price_item_id': price_item.id,
+        'price': float(price_item.price),
+        'price_without_vat': float(price_item.price_without_vat),
+        'vat_amount': float(price_item.vat_amount),
+        'vat_percent': float(price_item.vat_percent),
+        'vat_included': price_item.vat_included,
+
+        # ✅ Інформація про одиниці та фасування:
+        'unit_id': price_item.unit.id,
+        'unit_name': price_item.unit.name,
+        'unit_symbol': price_item.unit.symbol,
+
+        'unit_conversion_id': price_item.unit_conversion.id if price_item.unit_conversion else None,
+        'unit_conversion_name': price_item.unit_conversion.name if price_item.unit_conversion else None,
+
+        # ✅ Детальна інформація про фасування:
+        'package_info': package_info,
+
+        # ✅ Метадані:
+        'trade_point_id': price_item.trade_point.id if price_item.trade_point else None,
+        'price_type_id': price_item.price_type.id,
+        'valid_from': price_item.price_setting_document.valid_from.isoformat(),
+        'doc_number': price_item.price_setting_document.doc_number,
+    }
 class PriceAutoFillService:
     def __init__(self, document):
         self.document = document

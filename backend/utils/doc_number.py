@@ -2,41 +2,49 @@ from django.db.models import Max
 from backend.models import Document,  DocumentSettings
 
 
-def generate_document_number(doc_type: str, company) -> str:
-    """Генерація номеру документа з налаштувань компанії"""
-    try:
-        settings = DocumentSettings.objects.get(company=company)
-        prefix_map = {
-            'receipt': settings.receipt_prefix,
-            'sale': settings.sale_prefix,
-            'return_to_supplier': settings.return_to_supplier_prefix,
-            'return_from_client': settings.return_from_client_prefix,
-            'transfer': settings.transfer_prefix,
-            'inventory': settings.inventory_prefix,
-            'stock_in': settings.stock_in_prefix,
-            'conversion': settings.conversion_prefix,
-        }
-        prefix = prefix_map.get(doc_type, "999")
-    except DocumentSettings.DoesNotExist:
-        # Фолбек на старі значення
-        fallback = {
-            'receipt': '703', 'sale': '704', 'return_to_supplier': 'RTS',
-            'return_from_client': 'RFC', 'transfer': 'TRF', 'inventory': 'INV',
-            'stock_in': 'STI', 'conversion': 'CNV'
-        }
-        prefix = fallback.get(doc_type, "999")
+def generate_document_number(doc_type, company):
+    from backend.models import Document
+    from django.db import transaction
 
-    last = (
-        Document.objects
-        .filter(doc_type=doc_type, doc_number__startswith=prefix)
-        .aggregate(max_num=Max("doc_number"))["max_num"]
-    )
-    if last:
-        try:
-            last_seq = int(last.split("-")[-1])
-        except:
+    # Префікси для різних типів документів
+    prefix_map = {
+        'receipt': 'REC',
+        'sale': 'SALE',
+        'transfer': 'TRF',
+        'inventory': 'INV',
+        'return_to_supplier': 'RTS',
+        'return_from_client': 'RFC',
+        'stock_in': 'STI',
+        'conversion': 'CNV',
+    }
+
+    prefix = prefix_map.get(doc_type, 'DOC')
+
+    with transaction.atomic():
+        # ✅ ПРАВИЛЬНИЙ ЗАПИТ ДЛЯ ПОШУКУ ОСТАННЬОГО НОМЕРА:
+        last_doc = (
+            Document.objects
+            .select_for_update()
+            .filter(doc_number__startswith=prefix, company=company)  # ✅ ДОДАТИ company
+            .order_by('-id')  # ✅ СОРТУВАННЯ ПО ID
+            .first()
+        )
+
+        if last_doc and last_doc.doc_number:
+            try:
+                # Витягуємо номер після останнього дефіса
+                last_seq = int(last_doc.doc_number.split('-')[-1])
+            except (ValueError, IndexError):
+                last_seq = 0
+        else:
             last_seq = 0
-    else:
-        last_seq = 0
 
-    return f"{prefix}-{str(last_seq + 1).zfill(5)}"
+        new_seq = str(last_seq + 1).zfill(5)
+        new_number = f"{prefix}-{new_seq}"
+
+        # ✅ ДОДАТКОВА ПЕРЕВІРКА НА УНІКАЛЬНІСТЬ:
+        while Document.objects.filter(doc_number=new_number).exists():
+            last_seq += 1
+            new_number = f"{prefix}-{str(last_seq).zfill(5)}"
+
+        return new_number

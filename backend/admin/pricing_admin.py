@@ -1,3 +1,5 @@
+# pricing_admin.py - ВИПРАВЛЕНИЙ
+
 from django.contrib import admin
 from django.core.exceptions import ValidationError
 from django.db import transaction
@@ -7,7 +9,7 @@ from backend.models import (
     PriceType, PriceSettingDocument, PriceSettingItem,
     TradePoint, ProductUnitConversion, Unit
 )
-from unfold.admin import  ModelAdmin, TabularInline
+from unfold.admin import ModelAdmin, TabularInline
 
 
 @admin.register(PriceType)
@@ -24,7 +26,7 @@ class PriceSettingItemInline(TabularInline):
     fields = (
         'product', 'price_type', 'price',
         'vat_percent', 'vat_included', 'markup_percent',
-        'unit', 'unit_conversion', 'firm'
+        'unit_conversion', 'firm'  # ✅ ПРИБРАВ 'unit' - воно автоматичне
     )
     autocomplete_fields = ("product",)
     can_delete = True
@@ -39,34 +41,11 @@ class PriceSettingItemInline(TabularInline):
 
         return CustomFormSet
 
-    def formfield_for_foreignkey(self, db_field, request, **kwargs):
-        if db_field.name == "unit":
-            product_id = None
-            if request.method == "POST":
-                try:
-                    post_data = request.POST
-                    for key in post_data:
-                        if key.endswith("-product"):
-                            product_id = post_data[key]
-                            break
-                except:
-                    pass
-
-            if product_id:
-                unit_ids = ProductUnitConversion.objects.filter(
-                    product_id=product_id
-                ).values_list('to_unit_id', flat=True)
-                kwargs["queryset"] = Unit.objects.filter(id__in=unit_ids)
-            else:
-                kwargs["queryset"] = Unit.objects.none()
-
-        return super().formfield_for_foreignkey(db_field, request, **kwargs)
-
 
 @admin.register(PriceSettingDocument)
 class PriceSettingDocumentAdmin(ModelAdmin):
-    list_display = ('doc_number', 'company', 'valid_from', 'status')
-    list_filter = ('company', 'status')
+    list_display = ('doc_number', 'company', 'firm', 'valid_from', 'status')  # ✅ ДОДАВ firm
+    list_filter = ('company', 'firm', 'status')  # ✅ ДОДАВ firm
     search_fields = ('doc_number',)
     exclude = ['doc_number']
     inlines = [PriceSettingItemInline]
@@ -76,8 +55,11 @@ class PriceSettingDocumentAdmin(ModelAdmin):
         super().save_model(request, obj, form, change)
         form.save_m2m()
 
+        # ✅ АВТОМАТИЧНО ДОДАЄМО ТОРГОВІ ТОЧКИ ФІРМИ
         if obj.firm and not obj.trade_points.exists():
-            obj.trade_points.set(TradePoint.objects.filter(firm=obj.firm))
+            trade_points = TradePoint.objects.filter(firm=obj.firm)
+            if trade_points.exists():
+                obj.trade_points.set(trade_points)
 
     @transaction.atomic
     def save_related(self, request, form, formsets, change):
@@ -85,31 +67,29 @@ class PriceSettingDocumentAdmin(ModelAdmin):
 
         obj = form.instance
         trade_points = list(obj.trade_points.all())
+
         if not trade_points:
-            raise ValidationError("Виберіть хоча б одну торгову точку.")
+            raise ValidationError("Виберіть хоча б одну торгову точку або додайте торгову точку до фірми.")
 
         # ❌ Видаляємо попередні елементи
         PriceSettingItem.objects.filter(price_setting_document=obj).delete()
 
         for formset in formsets:
-            for form in formset.forms:
-                if form.cleaned_data and not form.cleaned_data.get("DELETE", False):
-                    item = form.save(commit=False)
+            for form_item in formset.forms:
+                if form_item.cleaned_data and not form_item.cleaned_data.get("DELETE", False):
+                    item_data = form_item.cleaned_data
 
-                    if not item.unit_conversion:
-                        raise ValidationError("Оберіть фасування (конверсію одиниці) для товару.")
-
+                    # ✅ ДОЗВОЛЯЄМО БЕЗ unit_conversion (базова одиниця)
                     for tp in trade_points:
                         PriceSettingItem.objects.create(
                             price_setting_document=obj,
-                            product=item.product,
-                            price_type=item.price_type,
-                            price=item.price,
-                            vat_percent=item.vat_percent,
-                            vat_included=item.vat_included,
-                            markup_percent=item.markup_percent,
+                            product=item_data['product'],
+                            price_type=item_data['price_type'],
+                            price=item_data['price'],
+                            vat_percent=item_data.get('vat_percent', 20),
+                            vat_included=item_data.get('vat_included', True),
+                            markup_percent=item_data.get('markup_percent', 0),
                             trade_point=tp,
-                            unit=item.unit,
-                            unit_conversion=item.unit_conversion,
+                            unit_conversion=item_data.get('unit_conversion'),  # ✅ Може бути None
                             firm=obj.firm
                         )

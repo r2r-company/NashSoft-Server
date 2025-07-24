@@ -1,14 +1,11 @@
 from backend.models import ProductUnitConversion
 
 def convert_to_base(product, from_unit, quantity):
-    """
-    Конвертує quantity з from_unit у базову одиницю товару (product.unit).
-    Якщо конверсія відсутня — повертає quantity як є (вважає, що одиниці збігаються).
-    """
-    if from_unit == product.unit:
-        return quantity  # Одиниці однакові — не треба нічого рахувати
 
-    # Спроба прямої конверсії
+    if from_unit == product.unit:
+        return quantity
+
+    # ✅ ПРЯМА КОНВЕРСІЯ: from_unit → product.unit
     direct = ProductUnitConversion.objects.filter(
         product=product,
         from_unit=from_unit,
@@ -17,14 +14,14 @@ def convert_to_base(product, from_unit, quantity):
     if direct:
         return quantity * direct.factor
 
-    # Спроба зворотної конверсії
+    # ✅ ЗВОРОТНА КОНВЕРСІЯ: product.unit → from_unit
     reverse = ProductUnitConversion.objects.filter(
         product=product,
         from_unit=product.unit,
         to_unit=from_unit
     ).first()
     if reverse and reverse.factor != 0:
-        return quantity / reverse.factor
+        # ✅ ВИПРАВЛЕННЯ: правильна зворотна конверсія
+        return quantity * reverse.factor  # НЕ ділити!
 
-    # 🚨 Якщо не знайдено конверсію — просто беремо як є
     return quantity

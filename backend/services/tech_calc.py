@@ -79,18 +79,26 @@ class TechCalculationService:
 
     def _expand_items(self, calculation, multiplier):
         for item in calculation.items.all():
+            # ✅ ВРАХОВУЄМО ФАСУВАННЯ:
+            base_quantity = self._get_base_quantity(item)
+            display_info = self._get_display_info(item)
+
             loss_factor = (1 - item.loss_percent / 100) * (1 - item.cooking_loss_percent / 100)
             if loss_factor == 0:
                 continue
 
-            real_qty = item.quantity / loss_factor
+            real_qty = base_quantity / loss_factor
             total_qty = real_qty * multiplier
 
             self.debug_info.append({
                 "product_id": item.component.id,
                 "name": item.component.name,
                 "unit": item.component.unit.symbol or item.component.unit.name,
-                "base_quantity": float(item.quantity),
+                # ✅ ДОДАЄМО ІНФОРМАЦІЮ ПРО ФАСУВАННЯ:
+                "recipe_quantity": float(item.quantity),  # Кількість в рецепті
+                "recipe_unit": display_info["unit_name"],  # Одиниця в рецепті
+                "base_quantity": float(base_quantity),  # В базових одиницях
+                "conversion_factor": float(display_info["conversion_factor"]),
                 "loss_percent": float(item.loss_percent),
                 "cooking_loss_percent": float(item.cooking_loss_percent),
                 "adjusted_quantity": round(real_qty, 5),
@@ -105,6 +113,13 @@ class TechCalculationService:
                     "unit": item.component.unit.symbol or item.component.unit.name,
                     "required_quantity": round(total_qty, 3),
                     "total_loss_percent": round((1 - loss_factor) * 100, 2),
+                    # ✅ ДОДАЄМО ІНФОРМАЦІЮ ПРО ФАСУВАННЯ В РЕЗУЛЬТАТ:
+                    "packaging_info": {
+                        "recipe_quantity": float(item.quantity),
+                        "recipe_unit": display_info["unit_name"],
+                        "conversion_factor": float(display_info["conversion_factor"]),
+                        "unit_conversion_id": display_info["unit_conversion_id"]
+                    }
                 })
             elif item.component.type == 'semi':
                 sub_calc = item.component.calculations.order_by('-date').first()
@@ -120,3 +135,53 @@ class TechCalculationService:
                     raise ValueError(f"Немає калькуляції для напівфабрикату: {item.component.name}")
             else:
                 continue
+
+    def _get_base_quantity(self, calculation_item):
+        """
+        Отримати кількість в базових одиницях
+
+        Якщо є unit_conversion - конвертуємо
+        Якщо немає - використовуємо як є
+        """
+        if hasattr(calculation_item, 'unit_conversion') and calculation_item.unit_conversion:
+            # Фасування: 2 мішки × 25 кг/мішок = 50 кг
+            return calculation_item.quantity * calculation_item.unit_conversion.factor
+        else:
+            # Базова одиниця: 2 кг = 2 кг
+            return calculation_item.quantity
+
+    def _get_display_info(self, calculation_item):
+        """
+        Отримати інформацію для відображення
+        """
+        if hasattr(calculation_item, 'unit_conversion') and calculation_item.unit_conversion:
+            return {
+                "unit_name": calculation_item.unit_conversion.to_unit.name,
+                "unit_symbol": calculation_item.unit_conversion.to_unit.symbol,
+                "conversion_factor": calculation_item.unit_conversion.factor,
+                "unit_conversion_id": calculation_item.unit_conversion.id
+            }
+        else:
+            return {
+                "unit_name": calculation_item.component.unit.name,
+                "unit_symbol": calculation_item.component.unit.symbol,
+                "conversion_factor": Decimal('1'),
+                "unit_conversion_id": None
+            }
+
+    def get_packaging_summary(self):
+        """
+        Додатковий метод для отримання зведення по фасуваннях
+        """
+        packaging_summary = []
+
+        for item in self.result:
+            if 'packaging_info' in item and item['packaging_info']['unit_conversion_id']:
+                packaging_summary.append({
+                    'ingredient': item['name'],
+                    'recipe_amount': f"{item['packaging_info']['recipe_quantity']} {item['packaging_info']['recipe_unit']}",
+                    'base_amount': f"{item['required_quantity']} {item['unit']}",
+                    'conversion': f"1 {item['packaging_info']['recipe_unit']} = {item['packaging_info']['conversion_factor']} {item['unit']}"
+                })
+
+        return packaging_summary

@@ -1,5 +1,6 @@
 from backend.services.document_services import ReceiptService, SaleService, TransferService, ReturnToSupplierService, \
     ReturnFromClientService, InventoryService, StockInDocumentService, ConversionDocumentService
+from production.services import ProductionOrderService
 
 
 def get_document_service(document):
@@ -12,6 +13,8 @@ def get_document_service(document):
         'inventory': InventoryService,
         'stock_in': StockInDocumentService,
         'conversion': ConversionDocumentService,
+        'production_order': ProductionOrderService,
+        'production': ProductionOrderService,
     }
 
     service_class = service_map.get(document.doc_type)

@@ -38,14 +38,27 @@ class ProductCalculationItemInline(TabularInline):
     model = ProductCalculationItem
     extra = 1
     autocomplete_fields = ['component']
-    fields = ['component', 'quantity', 'loss_percent', 'cooking_loss_percent', 'note']
+    fields = [
+        'component', 'quantity', 'unit_conversion', 'loss_percent',
+        'cooking_loss_percent', 'note'
+    ]
+
+    # ✅ ДОДАЄМО JAVASCRIPT ДЛЯ ФІЛЬТРАЦІЇ ФАСУВАНЬ
+    class Media:
+        js = ('admin/js/calculation_packaging.js',)
+
 
 @admin.register(ProductCalculation)
 class ProductCalculationAdmin(ModelAdmin):
-    list_display = ['product', 'date', 'note']
+    list_display = ['product', 'date', 'note', 'total_ingredients']
     list_filter = ['product__firm', 'product__type']
     search_fields = ['product__name', 'note']
     inlines = [ProductCalculationItemInline]
+
+    def total_ingredients(self, obj):
+        return obj.items.count()
+
+    total_ingredients.short_description = 'Кількість інгредієнтів'
 
 @admin.register(DiscountRule)
 class DiscountRuleAdmin(ModelAdmin):

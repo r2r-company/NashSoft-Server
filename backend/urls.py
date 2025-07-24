@@ -15,7 +15,9 @@ from backend.views import (
     AppUserListCreateView, AppUserDetailView, InterfaceListCreateView, InterfaceDetailView, ProductTotalStockView,
     TradePointListCreateView, TradePointDetailView, ReceiptProductsView, ProductUnitConversionDetailView,
     ProductUnitConversionListCreateView, ProductConversionsByProductIdView, ConversionActionView, StockValueReportView,
-    ProfitabilityReportView, inventory_in_action
+    ProfitabilityReportView, inventory_in_action, PriceSettingDocumentDetailView, ContractsByCustomerView,
+    ProductUnitConversionsView, ProductPricesView, ProductSpecificPriceView, ProductPricesDebugView,
+    ProductPricesSimpleDebugView, ProductSalePreviewView, get_product_packaging
 )
 from kkm.service.kkm.shift import ShiftStatusView, OpenShiftView, CloseShiftView
 from kkm.views import PrintMultiFirmReceiptsView
@@ -127,5 +129,14 @@ urlpatterns = [
     path('reports/profitability/', ProfitabilityReportView.as_view()),
     path('reports/stock-value/', StockValueReportView.as_view()),
     path('inventory_in/', inventory_in_action),
+    path("price-setting-documents/<int:pk>/", PriceSettingDocumentDetailView.as_view()),
+    path('contracts/by-customer/', ContractsByCustomerView.as_view(), name='contracts_by_customer'),  # ✅ ДОДАТИ ЦЕЙ URL
+    path('product-unit-conversions/', ProductUnitConversionsView.as_view(), name='product_unit_conversions'),
+    path('product-prices/', ProductPricesView.as_view(), name='product_prices'),
+    path('product-specific-price/', ProductSpecificPriceView.as_view(), name='product_specific_price'),
+    path('product-prices-debug/', ProductPricesDebugView.as_view(), name='product_prices_debug'),
+    path('product-debug/', ProductPricesSimpleDebugView.as_view()),
+    path('product-sale-preview/', ProductSalePreviewView.as_view(), name='product_sale_preview'),
+    path('api/products/<int:product_id>/packaging/', get_product_packaging, name='product_packaging'),
 
 ]

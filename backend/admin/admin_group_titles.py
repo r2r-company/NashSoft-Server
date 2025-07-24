@@ -1,50 +1,75 @@
-# backend/admin_group_titles.py
+# backend/admin/admin_group_titles.py - ПРОСТА РЕОРГАНІЗАЦІЯ
 
 GROUP_TITLES = {
-    "AuditLog": "🏢 Логи та дії",
-    "Company": "🏢 Компанія і структура",
-    "Firm": "🏢 Компанія і структура",
-    "Warehouse": "🏢 Компанія і структура",
-    "Department": "🏢 Компанія і структура",
-    "TradePoint": "🏢 Компанія і структура",
-    "DepartmentWarehouseAccess": "🏢 Компанія і структура",
-    "Unit": "📦 Склад і товари",
-    "ProductGroup": "📦 Склад і товари",
-    "Product": "📦 Склад і товари",
-    "ProductCalculation": "📦 Склад і товари",
-    "ProductCalculationItem": "📦 Склад і товари",
-    "DiscountRule": "📦 Склад і товари",
-    "ProductUnitConversion": "📦 Склад і товари",
-    "Customer": "👥 Контрагенти",
-    "Supplier": "👥 Контрагенти",
-    "Contract": "👥 Контрагенти",
-    "PaymentType": "👥 Контрагенти",
-    "PriceType": "💰 Ціноутворення",
-    "PriceSettingDocument": "💰 Ціноутворення",
-    "Document": "🧾 Документи",
-    "DocumentItem": "🧾 Документи",
-    "Operation": "🧾 Документи",
-    "DocumentSettings": "🧾 Документи",
-    "AccountingSettings": "🧾 Документи",
-    "AppUser": "👨‍💻 Користувачі",
-    "Interface": "👨‍💻 Користувачі",
-    "CashRegister": "🖨 Каса (ККМ)",
-    "CashShift": "🖨 Каса (ККМ)",
-    "CashSession": "🖨 Каса (ККМ)",
-    "FiscalReceipt": "🖨 Каса (ККМ)",
-    "ReceiptOperation": "🖨 Каса (ККМ)",
-    "CashWorkstation": "🖨 Каса (ККМ)",
-    "VchasnoDevice": "🖨 Каса (Вчасно)",
-    "VchasnoCashier": "🖨 Каса (Вчасно)",
-    "VchasnoShift": "🖨 Каса (Вчасно)",
-    "Account": "💵 Каса / Банк",
-    "MoneyDocument": "💵 Каса / Банк",
-    "MoneyOperation": "💵 Каса / Банк",
-    "MoneyLedgerEntry": "💵 Каса / Банк",
-    "CustomerType": "👥 Контрагенти",
+    # 🏢 ОСНОВА (найважливіше для роботи)
+    "Company": "🏢 Компанії та фірми",
+    "Firm": "🏢 Компанії та фірми",
+    "Warehouse": "🏢 Компанії та фірми",
+    "Department": "🏢 Компанії та фірми",
+    "TradePoint": "🏢 Компанії та фірми",
 
+    # 📦 ТОВАРИ (щоденна робота)
+    "Product": "📦 Товари та склад",
+    "ProductGroup": "📦 Товари та склад",
+    "ProductCalculation": "📦 Товари та склад",
+    "ProductCalculationItem": "📦 Товари та склад",
+    "Unit": "📦 Товари та склад",
+    "ProductUnitConversion": "📦 Товари та склад",
 
+    # 🧾 ДОКУМЕНТИ (основні операції)
+    "Document": "🧾 Документи та операції",
+    "DocumentItem": "🧾 Документи та операції",
+    "Operation": "🧾 Документи та операції",
 
+    # 👥 КОНТРАГЕНТИ
+    "Customer": "👥 Клієнти та постачальники",
+    "Supplier": "👥 Клієнти та постачальники",
+    "CustomerType": "👥 Клієнти та постачальники",
+    "Contract": "👥 Клієнти та постачальники",
 
+    # 💰 ЦІНИ
+    "PriceType": "💰 Ціни та знижки",
+    "PriceSettingDocument": "💰 Ціни та знижки",
+    "DiscountRule": "💰 Ціни та знижки",
 
+    # 💵 ФІНАНСИ
+    "Account": "💵 Каса та банк",
+    "MoneyDocument": "💵 Каса та банк",
+    "MoneyOperation": "💵 Каса та банк",
+    "MoneyLedgerEntry": "💵 Каса та банк",
+
+    # 🖨️ КАСИ
+    "CashRegister": "🖨️ Касові апарати",
+    "CashShift": "🖨️ Касові апарати",
+    "CashSession": "🖨️ Касові апарати",
+    "FiscalReceipt": "🖨️ Касові апарати",
+    "ReceiptOperation": "🖨️ Касові апарати",
+    "CashWorkstation": "🖨️ Касові апарати",
+    "VchasnoDevice": "🖨️ Касові апарати",
+    "VchasnoCashier": "🖨️ Касові апарати",
+    "VchasnoShift": "🖨️ Касові апарати",
+
+    # 🏭 ВИРОБНИЦТВО (весь новий модуль)
+    "ProductionLine": "🏭 Виробництво",
+    "WorkCenter": "🏭 Виробництво",
+    "Equipment": "🏭 Виробництво",
+    "ProductionPlan": "🏭 Виробництво",
+    "ProductionPlanItem": "🏭 Виробництво",
+    "ProductionOrder": "🏭 Виробництво",
+    "WorkerPosition": "🏭 Виробництво",
+    "ProductionWorker": "🏭 Виробництво",
+    "WorkShift": "🏭 Виробництво",
+
+    # 👨‍💻 КОРИСТУВАЧІ
+    "AppUser": "👨‍💻 Користувачі та права",
+    "Interface": "👨‍💻 Користувачі та права",
+
+    # ⚙️ НАЛАШТУВАННЯ (ховаємо внизу)
+    "AccountingSettings": "⚙️ Налаштування",
+    "DocumentSettings": "⚙️ Налаштування",
+    "PaymentType": "⚙️ Налаштування",
+    "DepartmentWarehouseAccess": "⚙️ Налаштування",
+
+    # 📊 ЛОГИ (для техніків)
+    "AuditLog": "📊 Логи системи",
 }

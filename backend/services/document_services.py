@@ -324,6 +324,10 @@ class SaleService(BaseDocumentService):
             converted_qty = convert_to_base(item.product, item.unit, item.quantity)
             item.converted_quantity = converted_qty
 
+            # ✅ НОВА ЛОГІКА: автопідстановка ціни з ціноутворення
+            if not item.price or item.price == 0:
+                self._auto_fill_price_from_setting(item)
+
             if item.price_with_vat and not item.vat_amount:
                 apply_vat(item, mode="from_price_with_vat")
             else:
@@ -355,59 +359,54 @@ class SaleService(BaseDocumentService):
         AccountingService(self.document).generate_entries()
         AutoMoneyDocumentService.create_from_document(self.document)
 
-    def _auto_create_payment(self):
-        payment_type = self.document.payment_type
-        if not payment_type or payment_type.name not in ["Готівка", "Безготівка"]:
-            return
+    def _auto_fill_price_from_setting(self, item):
+        """
+        ✅ НОВА ФУНКЦІЯ: автопідстановка ціни з ціноутворення
+        """
+        from backend.services.price import get_price_from_setting
+        from backend.models import ProductUnitConversion
 
-        doc_type = 'cash_income' if payment_type.name == "Готівка" else 'bank_income'
+        # Визначаємо фасування на основі одиниці товару
+        unit_conversion = None
+        if item.unit != item.product.unit:
+            # Шукаємо фасування що відповідає одиниці
+            unit_conversion = ProductUnitConversion.objects.filter(
+                product=item.product,
+                to_unit=item.unit
+            ).first()
 
-        from settlements.models import Account
-        account = Account.objects.filter(
-            company=self.document.company,
-            type='cash' if doc_type == 'cash_income' else 'bank'
-        ).first()
-
-        if not account:
-            return
-
-        amount = sum(item.quantity * item.price for item in self.document.items.all())
-
-        money_doc = MoneyDocument.objects.create(
-            doc_type=doc_type,
-            company=self.document.company,
+        # Отримуємо ціну з ціноутворення
+        price_data = get_price_from_setting(
+            product=item.product,
             firm=self.document.firm,
-            comment=f"Оплата за реалізацію {self.document.doc_number}",
-            source_document=self.document,
-            customer=self.document.customer,
-            account=account,
-            amount=amount,
-            status='posted'
+            trade_point=getattr(self.document, 'trade_point', None),
+            price_type=getattr(self.document, 'price_type', None),
+            unit_conversion=unit_conversion
         )
 
-        MoneyOperation.objects.create(
-            document=money_doc,
-            amount=amount,
-            direction='in',
-            account=account,
-            source_document=self.document,
-            customer=self.document.customer,
-            visible=True
-        )
+        if price_data:
+            # Підставляємо ціну
+            item.price = price_data['price']
+            item.vat_percent = price_data['vat_percent']
+            item.vat_included = price_data['vat_included']
 
-        from settlements.models import MoneyLedgerEntry
-        MoneyLedgerEntry.objects.create(
-            document=money_doc,
-            date=money_doc.date,
-            debit_account=301,
-            credit_account=361,
-            amount=amount,
-            comment=f"Автопроводка по {money_doc.doc_number}",
-            customer=self.document.customer
-        )
+            self.logger.log_event("price_auto_filled",
+                                  f"Автопідстановка ціни для {item.product.name}: {item.price} грн")
+        else:
+            # Якщо ціна не знайдена - логуємо попередження
+            self.logger.log_event("price_not_found",
+                                  f"Ціна не знайдена для {item.product.name}, залишаємо 0",
+                                  level="WARNING")
 
-        self.logger.log_event("auto_payment_created", f"Створено оплату {money_doc.doc_number}")
+    def unpost(self):
+        if self.document.status != 'posted':
+            raise DocumentNotPostedException()
 
+        DocumentValidator(self.document).check_can_unpost()
+        Operation.objects.filter(document=self.document).delete()
+        self.document.status = 'draft'
+        self.document.save()
+        self.logger.log_event("sale_unposted", f"Документ {self.document.doc_number} розпроведено")
 
 
 class ReturnFromClientService(BaseDocumentService):

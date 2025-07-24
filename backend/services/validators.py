@@ -27,11 +27,18 @@ class DocumentValidator:
     # ====== ПРОВЕДЕННЯ ======
     def _can_post_sale(self):
         for item in self.document.items.all():
+            # ✅ ВИПРАВЛЕННЯ: конвертуємо кількість у базову одиницю
+            from backend.utils.unit_converter import convert_to_base
+
+            converted_qty = convert_to_base(item.product, item.unit, item.quantity)
             available_qty = self._get_available_quantity(item.product, self.document.warehouse)
-            if available_qty < item.quantity:
-                self.logger.log_event("fail_post_sale", f"Недостатньо залишку: {item.product.name}, потрібно {item.quantity}, є {available_qty}")
+
+            if available_qty < converted_qty:
+                self.logger.log_event("fail_post_sale",
+                                      f"Недостатньо залишку: {item.product.name}, потрібно {converted_qty} {item.product.unit.name}, є {available_qty}")
                 raise ValidationError(
-                    f"Недостатньо залишку для товару '{item.product.name}'. Потрібно {item.quantity}, є {available_qty}"
+                    f"Недостатньо залишку для товару '{item.product.name}'. "
+                    f"Потрібно {converted_qty}, є {available_qty}"
                 )
 
     def _can_post_return_from_client(self):

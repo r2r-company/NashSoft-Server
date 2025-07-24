@@ -36,10 +36,11 @@ schema_view = get_schema_view(
 
 
 urlpatterns = [
-    path('', stock_report, name='home'),  # Робимо stock_report головною сторінкою
+    path('', stock_report, name='home'),
     path('admin/', admin.site.urls),
-    path('api/', include('backend.urls')),  # ✅ Додаємо всі маршрути з апки backend
-    path('api/', include('settlements.urls')),  # ← ось це додай
+    path('api/', include('backend.urls')),
+    path('api/', include('settlements.urls')),
+    path('production/', include('production.urls')),
 
     # Swagger / ReDoc
     path('swagger/', schema_view.with_ui('swagger', cache_timeout=0), name='schema-swagger-ui'),

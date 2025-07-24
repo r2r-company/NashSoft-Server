@@ -67,6 +67,7 @@ INSTALLED_APPS = [
     'vchasno_kasa',
     'django_extensions',
     "corsheaders",
+    "production",
 
 ]
 

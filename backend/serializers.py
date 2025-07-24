@@ -16,6 +16,8 @@ from settlements.models import Account, Contract
 class DocumentItemSerializer(serializers.ModelSerializer):
     price = serializers.DecimalField(max_digits=10, decimal_places=2, required=False)
     unit = serializers.PrimaryKeyRelatedField(queryset=Unit.objects.all(), required=False)
+    unit_conversion = serializers.PrimaryKeyRelatedField(queryset=ProductUnitConversion.objects.all(), required=False,
+                                                         allow_null=True)  # ✅ ДОДАТИ ЦЕ ПОЛЕ
     vat_percent = serializers.DecimalField(max_digits=5, decimal_places=2, required=False)
     document = serializers.PrimaryKeyRelatedField(read_only=True)
     role = serializers.CharField(required=False, allow_null=True)
@@ -95,9 +97,6 @@ class DocumentItemSerializer(serializers.ModelSerializer):
             validated_data['price_with_vat'] = price
 
         return super().create(validated_data)
-    class Meta:
-        model = DocumentItem
-        fields = "__all__"
 
 
 class DocumentSerializer(serializers.ModelSerializer):
@@ -155,49 +154,111 @@ class DocumentSerializer(serializers.ModelSerializer):
             validated_data['status'] = 'draft'
             document = Document.objects.create(**validated_data)
 
-            for item in items_data:
-                if 'unit' not in item or not item['unit']:
-                    item['unit'] = item['product'].unit
+            for item_data in items_data:
+                if 'unit' not in item_data or not item_data['unit']:
+                    item_data['unit'] = item_data['product'].unit
 
-                # ⬇️ НОВА ЛОГІКА ЦІН ДЛЯ РІЗНИХ ДОКУМЕНТІВ
+                # ✅ НОВА ЛОГІКА: автопідстановка цін при створенні
                 if validated_data['doc_type'] == 'sale':
-                    # Для продажів - отримуємо ціну з прайсу
-                    if 'price' not in item or item['price'] is None:
-                        pt = price_type or PriceType.objects.filter(is_default=True).first()
-                        price = get_price_from_setting(
-                            product=item['product'],
-                            firm=validated_data['firm'],
-                            trade_point=trade_point,
-                            price_type=pt
-                        )
-                        if price is None:
-                            raise serializers.ValidationError({
-                                'items': [f"Ціна для товару '{item['product']}' по типу '{pt}' не знайдена."]
-                            })
-                        item['price'] = price
+                    price_value = item_data.get('price', 0)
+                    if (not price_value or
+                            price_value == 0 or
+                            str(price_value) == '0.00' or
+                            float(price_value) == 0.0):
+                        print(f"🔍 Автопідстановка ціни для {item_data['product'].name}")
+                        self._auto_fill_price_for_item(document, item_data)
+                        print(f"✅ Ціна встановлена: {item_data.get('price', 'НЕ ЗНАЙДЕНО')}")
 
-                elif validated_data['doc_type'] == 'receipt':
-                    # Для поступлень - ціна = собівартість закупки
-                    if 'price' not in item or item['price'] is None:
+                # ✅ СПРОСТИТИ ЛОГІКУ ЦІН:
+                if validated_data['doc_type'] == 'receipt':
+                    # Для поступлень - ціна обов'язкова
+                    if 'price' not in item_data or item_data['price'] is None:
                         raise serializers.ValidationError({
-                            'items': [f"Для поступлення потрібно вказати ціну закупки товару '{item['product']}'."]
+                            'items': [f"Для поступлення потрібно вказати ціну закупки товару '{item_data['product']}'."]
                         })
 
-                elif validated_data['doc_type'] == 'conversion':
-                    # Для фасування - ціни не потрібні (рахуються автоматично)
-                    if 'price' not in item:
-                        item['price'] = 0  # Тимчасово, буде перерахована при проведенні
+                # ✅ АВТОПІДСТАНОВКА ПДВ БЕЗ СКЛАДНОЇ ЛОГІКИ:
+                if 'vat_percent' not in item_data or item_data['vat_percent'] is None:
+                    # Перевіряємо чи фірма платник ПДВ
+                    firm = validated_data.get('firm')
+                    if firm and hasattr(firm, 'is_vat_payer') and firm.is_vat_payer:
+                        item_data['vat_percent'] = 20
+                    else:
+                        item_data['vat_percent'] = 0
 
-                # ⬇️ Автопідстановка ПДВ
-                if 'vat_percent' not in item or item['vat_percent'] is None:
-                    item['vat_percent'] = 20
+                # ✅ СТВОРЮЄМО ITEM:
+                item_instance = DocumentItem.objects.create(document=document, **item_data)
 
-                item_instance = DocumentItem.objects.create(document=document, **item)
-                apply_vat(item_instance)
+                # ✅ ПРОСТИЙ РОЗРАХУНОК ПДВ:
+                price = item_instance.price
+                vat_percent = item_instance.vat_percent or 0
+
+                if vat_percent > 0:
+                    # Припускаємо що ціна з ПДВ
+                    price_without_vat = round(price / (1 + vat_percent / 100), 2)
+                    vat_amount = round(price - price_without_vat, 2)
+                    price_with_vat = price
+                else:
+                    price_without_vat = price
+                    vat_amount = 0
+                    price_with_vat = price
+
+                item_instance.price_without_vat = price_without_vat
+                item_instance.vat_amount = vat_amount
+                item_instance.price_with_vat = price_with_vat
                 item_instance.save()
 
         return document
 
+    def _auto_fill_price_for_item(self, document, item_data):
+        """
+        ✅ ВИПРАВЛЕНА функція: автопідстановка ціни з урахуванням unit_conversion
+        """
+        from backend.services.price import get_price_from_setting
+        from backend.models import ProductUnitConversion, TradePoint
+
+        product = item_data['product']
+        unit = item_data.get('unit')
+
+        # ✅ НОВА ЛОГІКА: використовуємо unit_conversion якщо передано
+        unit_conversion = item_data.get('unit_conversion')
+
+        if unit_conversion:
+            # ✅ ВИПРАВЛЕННЯ: ЗАВЖДИ підставляємо правильну одиницю з фасування
+            item_data['unit'] = unit_conversion.to_unit
+            print(f"🔍 Використовуємо unit_conversion: {unit_conversion.name}")
+            print(f"🔍 Підставляємо unit з фасування: {unit_conversion.to_unit.name}")
+        else:
+            # Якщо немає unit_conversion - шукаємо по одиниці
+            if unit and unit != product.unit:
+                unit_conversion = ProductUnitConversion.objects.filter(
+                    product=product,
+                    to_unit=unit
+                ).first()
+                print(f"🔍 Знайдено unit_conversion по одиниці: {unit_conversion.name if unit_conversion else 'None'}")
+
+        # ✅ ВИПРАВЛЕННЯ: завжди шукаємо торгову точку для фірми
+        trade_point = getattr(document, 'trade_point', None)
+        if not trade_point:
+            trade_point = TradePoint.objects.filter(firm=document.firm).first()
+            print(f"🔍 Підставляємо торгову точку: {trade_point.name if trade_point else 'None'}")
+
+        # Отримуємо ціну з ціноутворення
+        price_data = get_price_from_setting(
+            product=product,
+            firm=document.firm,
+            trade_point=trade_point,
+            price_type=getattr(document, 'price_type', None),
+            unit_conversion=unit_conversion
+        )
+
+        if price_data:
+            item_data['price'] = price_data['price']
+            item_data['vat_percent'] = price_data['vat_percent']
+            print(
+                f"✅ Автопідстановка ціни: {price_data['price']} грн (фасування: {unit_conversion.name if unit_conversion else 'базова'})")
+        else:
+            print(f"⚠️ Ціна не знайдена")
 
 
 class DocumentListSerializer(serializers.ModelSerializer):
@@ -205,6 +266,17 @@ class DocumentListSerializer(serializers.ModelSerializer):
     firm_name = serializers.CharField(source='firm.name', required=False)
     warehouse_name = serializers.CharField(source='warehouse.name', required=False)
     target_warehouse_name = serializers.CharField(source='target_warehouse.name', required=False)
+
+    # ✅ ДОДАТИ ДЛЯ РЕАЛІЗАЦІЇ:
+    customer_id = serializers.IntegerField(source='customer.id', required=False)
+    customer_name = serializers.CharField(source='customer.name', required=False)
+    trade_point_id = serializers.IntegerField(source='trade_point.id', required=False)
+    trade_point_name = serializers.CharField(source='trade_point.name', required=False)
+
+    # ✅ ПОЛЯ ДЛЯ ПОСТУПЛЕННЯ:
+    supplier_id = serializers.IntegerField(source='supplier.id', required=False)
+    supplier_name = serializers.CharField(source='supplier.name', required=False)
+
     doc_type = serializers.CharField()
     doc_number = serializers.CharField()
     status = serializers.CharField()
@@ -213,17 +285,13 @@ class DocumentListSerializer(serializers.ModelSerializer):
     class Meta:
         model = Document
         fields = [
-            'id',
-            'doc_type',
-            'doc_number',
-            'date',
-            'company_name',
-            'firm_name',
-            'warehouse_name',
-            'target_warehouse_name',
+            'id', 'doc_type', 'doc_number', 'date',
+            'company_name', 'firm_name', 'warehouse_name', 'target_warehouse_name',
+            'supplier_id', 'supplier_name',      # ✅ ДЛЯ ПОСТУПЛЕННЯ
+            'customer_id', 'customer_name',      # ✅ ДЛЯ РЕАЛІЗАЦІЇ
+            'trade_point_id', 'trade_point_name', # ✅ ДЛЯ РЕАЛІЗАЦІЇ
             'status',
         ]
-
 
 
 class UnitSerializer(serializers.ModelSerializer):
@@ -232,39 +300,79 @@ class UnitSerializer(serializers.ModelSerializer):
         fields = ['id', 'name', 'symbol']
 
 
-
 class PriceSettingItemSerializer(serializers.ModelSerializer):
+    price_type_name = serializers.CharField(source='price_type.name', read_only=True)
+    product_name = serializers.CharField(source='product.name', read_only=True)
+    trade_point_name = serializers.CharField(source='trade_point.name', read_only=True)
+    unit_name = serializers.CharField(source='unit.name', read_only=True)
+
+    # ✅ ДОДАТИ ФІРМУ:
+    firm_name = serializers.CharField(source='firm.name', read_only=True)
+    firm_is_vat_payer = serializers.BooleanField(source='firm.is_vat_payer', read_only=True)
+
+    # ✅ РОЗРАХОВАНІ ПОЛЯ ПДВ:
+    price_without_vat = serializers.SerializerMethodField()
+    vat_amount = serializers.SerializerMethodField()
+    price_with_vat = serializers.SerializerMethodField()
+
     class Meta:
         model = PriceSettingItem
         fields = [
-            'product', 'price_type', 'price',
-            'vat_percent', 'vat_included', 'markup_percent',
-            'unit', 'unit_conversion'
+            'product', 'product_name',
+            'price_type', 'price_type_name',
+            'price', 'vat_percent', 'vat_included', 'markup_percent',
+            'unit', 'unit_name', 'unit_conversion',
+            'trade_point', 'trade_point_name',
+            'firm', 'firm_name', 'firm_is_vat_payer',  # ✅ ФІРМА
+            'price_without_vat', 'vat_amount', 'price_with_vat'
         ]
 
-    def validate(self, data):
-        product = data.get("product")
-        unit = data.get("unit")
-        unit_conversion = data.get("unit_conversion")
+    def get_price_without_vat(self, obj):
+        """Розрахунок ціни без ПДВ"""
+        if obj.vat_included and obj.vat_percent > 0:
+            # Якщо ціна включає ПДВ - витягуємо ПДВ
+            return round(obj.price / (1 + obj.vat_percent / 100), 2)
+        else:
+            # Якщо ціна без ПДВ
+            return obj.price
 
-        # 🔍 якщо одиниця співпадає з базовою — unit_conversion не треба
-        if unit and product and unit != product.unit:
-            if not unit_conversion:
-                raise serializers.ValidationError("Оберіть фасування (unit_conversion), бо одиниця не базова.")
-        return data
+    def get_vat_amount(self, obj):
+        """Розрахунок суми ПДВ"""
+        if obj.vat_percent > 0:
+            price_without_vat = self.get_price_without_vat(obj)
+            return round(price_without_vat * obj.vat_percent / 100, 2)
+        return 0
+
+    def get_price_with_vat(self, obj):
+        """Розрахунок ціни з ПДВ"""
+        if obj.vat_included:
+            # Якщо ціна вже включає ПДВ
+            return obj.price
+        else:
+            # Якщо ціна без ПДВ - додаємо ПДВ
+            vat_amount = self.get_vat_amount(obj)
+            return round(obj.price + vat_amount, 2)
 
 
 class PriceSettingDocumentSerializer(serializers.ModelSerializer):
     id = serializers.IntegerField(read_only=True)  # ← додаєш це
     items = PriceSettingItemSerializer(many=True)
+    company_name = serializers.CharField(source='company.name', read_only=True)
+    firm_name = serializers.CharField(source='firm.name', read_only=True)
+    trade_points_names = serializers.SerializerMethodField()
+
+    def get_trade_points_names(self, obj):
+        return [tp.name for tp in obj.trade_points.all()]
 
     class Meta:
         model = PriceSettingDocument
         fields = [
-            'id',  # ← і тут
-            'doc_number', 'company', 'firm', 'valid_from', 'status',
+            'id',
+            'doc_number', 'company', 'company_name',
+            'firm', 'firm_name',
+            'valid_from', 'status',
             'base_type', 'base_group', 'base_receipt', 'base_price_type',
-            'trade_points', 'items'
+            'trade_points', 'trade_points_names', 'items'
         ]
         read_only_fields = ['doc_number']
 
@@ -342,10 +450,12 @@ class ProductSerializer(serializers.ModelSerializer):
     group_id = serializers.IntegerField(source='group.id', read_only=True)
     group_name = serializers.CharField(source='group.name', read_only=True)
     price = serializers.SerializerMethodField()
+    unit_name = serializers.CharField(source='unit.name', read_only=True)  # ✅ ДОДАЙ
+
 
     class Meta:
         model = Product
-        fields = ['id', 'name', 'unit',  'group_id', 'group_name', 'price']
+        fields = ['id', 'name', 'unit', 'unit_name', 'group_id', 'group_name', 'price']
 
     def get_price(self, obj):
         from backend.models import PriceSettingItem, PriceType
@@ -397,11 +507,14 @@ class CompanySerializer(serializers.ModelSerializer):
 
 
 class WarehouseSerializer(serializers.ModelSerializer):
-    company_name = serializers.CharField(source="company.name", read_only=True)
+    company_name = serializers.CharField(source='company.name', read_only=True)
+    company_id = serializers.IntegerField(source='company.id', read_only=True)
+    firm_id = serializers.IntegerField(source='firm.id', read_only=True)  # ✅ ДОДАТИ
+    firm_name = serializers.CharField(source='firm.name', read_only=True) # ✅ ДОДАТИ
 
     class Meta:
         model = Warehouse
-        fields = ["id", "name", "company_name"]
+        fields = ['id', 'name', 'company_name', 'company_id', 'firm_id', 'firm_name']
 
 class WarehouseSerializer(serializers.ModelSerializer):
     company_name = serializers.CharField(source="company.name", read_only=True)
@@ -443,8 +556,8 @@ class PaymentTypeSerializer(serializers.ModelSerializer):
 
 
 class FirmSerializer(serializers.ModelSerializer):
-    company = serializers.CharField(source='company.name', read_only=True)
-    company_id = serializers.PrimaryKeyRelatedField(queryset=Company.objects.all(), write_only=True, source='company')
+    company_name = serializers.CharField(source='company.name', read_only=True)
+    company_id = serializers.IntegerField(source='company.id', read_only=True)  # ✅ ДОДАТИ ДЛЯ ЧИТАННЯ
     is_vat = serializers.SerializerMethodField()
 
     def get_is_vat(self, obj):
@@ -452,9 +565,7 @@ class FirmSerializer(serializers.ModelSerializer):
 
     class Meta:
         model = Firm
-        fields = ['id', 'name', 'company', 'company_id', 'is_vat', 'vat_type']
-
-
+        fields = ['id', 'name', 'company_name', 'company_id', 'is_vat', 'vat_type']
 
 class DepartmentSerializer(serializers.ModelSerializer):
     firm_name = serializers.CharField(source='firm.name', read_only=True)
@@ -522,3 +633,21 @@ class ProductUnitConversionSerializer(serializers.ModelSerializer):
         model = ProductUnitConversion
         fields = '__all__'
 
+
+
+class ContractSerializer(serializers.ModelSerializer):
+    supplier_name = serializers.CharField(source='supplier.name', read_only=True)
+    client_name = serializers.CharField(source='client.name', read_only=True)
+    payment_type_name = serializers.CharField(source='payment_type.name', read_only=True)
+    account_name = serializers.CharField(source='account.name', read_only=True)
+    firm_id = serializers.IntegerField(source='firm.id', read_only=True)     # ✅ ДОДАТИ
+    firm_name = serializers.CharField(source='firm.name', read_only=True)   # ✅ ДОДАТИ
+
+    class Meta:
+        model = Contract
+        fields = [
+            'id', 'name', 'supplier', 'supplier_name', 'client', 'client_name',
+            'firm_id', 'firm_name',  # ✅ ДОДАТИ
+            'payment_type', 'payment_type_name', 'account', 'account_name',
+            'contract_type', 'doc_file', 'is_active', 'status'
+        ]
