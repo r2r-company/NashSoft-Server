@@ -7,19 +7,19 @@
 <script>
 $(function(){
 	jQuery.ajaxQueue({
-		url: "test.php",
+		url: "tests.php",
 		success: function(html){ jQuery("ul").append(html); }
 	});
 	jQuery.ajaxQueue({
-		url: "test.php",
+		url: "tests.php",
 		success: function(html){ jQuery("ul").append(html); }
 	});
 	jQuery.ajaxSync({
-		url: "test.php",
+		url: "tests.php",
 		success: function(html){ jQuery("ul").append("<b>"+html+"</b>"); }
 	});
 	jQuery.ajaxSync({
-		url: "test.php",
+		url: "tests.php",
 		success: function(html){ jQuery("ul").append("<b>"+html+"</b>"); }
 	});
 });

@@ -17,7 +17,9 @@ from backend.views import (
     ProductUnitConversionListCreateView, ProductConversionsByProductIdView, ConversionActionView, StockValueReportView,
     ProfitabilityReportView, inventory_in_action, PriceSettingDocumentDetailView, ContractsByCustomerView,
     ProductUnitConversionsView, ProductPricesView, ProductSpecificPriceView, ProductPricesDebugView,
-    ProductPricesSimpleDebugView, ProductSalePreviewView, get_product_packaging
+    ProductPricesSimpleDebugView, ProductSalePreviewView, get_product_packaging, TrialBalanceView, BalanceSheetView,
+    ProfitLossView, CostCenterAnalysisView, ExchangeRatesView, BudgetExecutionView, CashFlowForecastView,
+    LiquidityRiskView
 )
 from kkm.service.kkm.shift import ShiftStatusView, OpenShiftView, CloseShiftView
 from kkm.views import PrintMultiFirmReceiptsView
@@ -137,6 +139,21 @@ urlpatterns = [
     path('product-prices-debug/', ProductPricesDebugView.as_view(), name='product_prices_debug'),
     path('product-debug/', ProductPricesSimpleDebugView.as_view()),
     path('product-sale-preview/', ProductSalePreviewView.as_view(), name='product_sale_preview'),
-    path('api/products/<int:product_id>/packaging/', get_product_packaging, name='product_packaging'),
+    path('products/<int:product_id>/packaging/', get_product_packaging, name='product_packaging'),
+    path('finance/trial-balance/', TrialBalanceView.as_view(), name='trial_balance'),
+    path('finance/balance-sheet/', BalanceSheetView.as_view(), name='balance_sheet'),
+    path('finance/profit-loss/', ProfitLossView.as_view(), name='profit_loss'),
 
+    # === ЦЕНТРИ ВИТРАТ ===
+    path('finance/cost-centers/', CostCenterAnalysisView.as_view(), name='cost_centers'),
+
+    # === ВАЛЮТНІ ОПЕРАЦІЇ ===
+    path('finance/exchange-rates/', ExchangeRatesView.as_view(), name='exchange_rates'),
+
+    # === БЮДЖЕТУВАННЯ ===
+    path('finance/budget-execution/', BudgetExecutionView.as_view(), name='budget_execution'),
+
+    # === CASHFLOW ===
+    path('finance/cashflow-forecast/', CashFlowForecastView.as_view(), name='cashflow_forecast'),
+    path('finance/liquidity-risk/', LiquidityRiskView.as_view(), name='liquidity_risk'),
 ]

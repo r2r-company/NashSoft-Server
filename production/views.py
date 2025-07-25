@@ -721,3 +721,575 @@ class QuickActionsView(APIView):
 
         except Exception as e:
             return StandardResponse.error(str(e))
+
+
+# production/views_extended.py - НОВІ API ДЛЯ РОЗШИРЕНОГО ФУНКЦІОНАЛУ
+
+from rest_framework.viewsets import ModelViewSet
+from rest_framework.decorators import action
+from rest_framework.response import Response
+from rest_framework.permissions import AllowAny
+from rest_framework import status
+from django.utils import timezone
+from datetime import timedelta
+from django.db.models import Q
+
+from .models import (
+    MaintenanceSchedule, MaintenanceType, QualityCheck, QualityCheckPoint,
+    WasteRecord, WasteType, WorkTimeNorm
+)
+from .services_extended import (
+    MaintenanceService, QualityControlService, WasteManagementService,
+    WorkTimeNormService, ProductionAnalyticsService
+)
+from backend.utils.responses import StandardResponse
+
+
+class MaintenanceViewSet(ModelViewSet):
+    """API для управління технічним обслуговуванням"""
+    queryset = MaintenanceSchedule.objects.all()
+    permission_classes = [AllowAny]
+
+    def get_queryset(self):
+        queryset = super().get_queryset()
+
+        # Фільтри
+        company_id = self.request.query_params.get('company')
+        production_line_id = self.request.query_params.get('production_line')
+        status_filter = self.request.query_params.get('status')
+
+        if company_id:
+            queryset = queryset.filter(production_line__company_id=company_id)
+
+        if production_line_id:
+            queryset = queryset.filter(production_line_id=production_line_id)
+
+        if status_filter:
+            queryset = queryset.filter(status=status_filter)
+
+        return queryset.order_by('scheduled_date')
+
+    def list(self, request):
+        """Список планових ТО"""
+        queryset = self.get_queryset()
+
+        # Додаткові фільтри
+        date_from = request.query_params.get('date_from')
+        date_to = request.query_params.get('date_to')
+
+        if date_from and date_to:
+            queryset = queryset.filter(scheduled_date__range=[date_from, date_to])
+
+        data = []
+        for schedule in queryset:
+            data.append({
+                'id': schedule.id,
+                'production_line': {
+                    'id': schedule.production_line.id,
+                    'name': schedule.production_line.name
+                },
+                'maintenance_type': {
+                    'id': schedule.maintenance_type.id,
+                    'name': schedule.maintenance_type.name
+                },
+                'scheduled_date': schedule.scheduled_date,
+                'estimated_duration': schedule.estimated_duration,
+                'status': schedule.status,
+                'is_overdue': schedule.is_overdue(),
+                'assigned_to': schedule.assigned_to.username if schedule.assigned_to else None,
+                'actual_duration': schedule.get_actual_duration(),
+                'actual_cost': schedule.actual_cost
+            })
+
+        return StandardResponse.success(data, "Список планового ТО")
+
+    @action(detail=False, methods=['get'])
+    def overdue(self, request):
+        """Прострочені ТО"""
+        company_id = request.query_params.get('company')
+
+        service = MaintenanceService()
+        overdue_maintenance = service.get_overdue_maintenance(company_id)
+
+        data = [{
+            'id': item.id,
+            'production_line': item.production_line.name,
+            'maintenance_type': item.maintenance_type.name,
+            'scheduled_date': item.scheduled_date,
+            'days_overdue': (timezone.now() - item.scheduled_date).days
+        } for item in overdue_maintenance]
+
+        return StandardResponse.success(data, f"Знайдено {len(data)} прострочених ТО")
+
+    @action(detail=False, methods=['get'])
+    def upcoming(self, request):
+        """Найближчі ТО"""
+        company_id = request.query_params.get('company')
+        days_ahead = int(request.query_params.get('days', 7))
+
+        service = MaintenanceService()
+        upcoming_maintenance = service.get_upcoming_maintenance(days_ahead, company_id)
+
+        data = [{
+            'id': item.id,
+            'production_line': item.production_line.name,
+            'maintenance_type': item.maintenance_type.name,
+            'scheduled_date': item.scheduled_date,
+            'days_until': (item.scheduled_date - timezone.now()).days,
+            'assigned_to': item.assigned_to.username if item.assigned_to else None
+        } for item in upcoming_maintenance]
+
+        return StandardResponse.success(data, f"Найближчі ТО ({days_ahead} днів)")
+
+    @action(detail=True, methods=['post'])
+    def start(self, request, pk=None):
+        """Початок виконання ТО"""
+        service = MaintenanceService()
+
+        try:
+            schedule = service.start_maintenance(pk, request.user)
+            return StandardResponse.success({
+                'id': schedule.id,
+                'status': schedule.status,
+                'actual_start': schedule.actual_start
+            }, "ТО розпочато")
+        except Exception as e:
+            return StandardResponse.error(str(e))
+
+    @action(detail=True, methods=['post'])
+    def complete(self, request, pk=None):
+        """Завершення ТО"""
+        service = MaintenanceService()
+
+        data = request.data
+        actual_cost = data.get('actual_cost', 0)
+        completion_notes = data.get('completion_notes', '')
+
+        try:
+            schedule = service.complete_maintenance(
+                pk, actual_cost, completion_notes, request.user
+            )
+            return StandardResponse.success({
+                'id': schedule.id,
+                'status': schedule.status,
+                'actual_end': schedule.actual_end,
+                'next_maintenance_date': schedule.next_maintenance_date,
+                'actual_duration': schedule.get_actual_duration()
+            }, "ТО завершено")
+        except Exception as e:
+            return StandardResponse.error(str(e))
+
+
+class QualityControlViewSet(ModelViewSet):
+    """API для контролю якості"""
+    queryset = QualityCheck.objects.all()
+    permission_classes = [AllowAny]
+
+    def get_queryset(self):
+        queryset = super().get_queryset()
+
+        production_order_id = self.request.query_params.get('production_order')
+        production_line_id = self.request.query_params.get('production_line')
+        status_filter = self.request.query_params.get('status')
+
+        if production_order_id:
+            queryset = queryset.filter(production_order_id=production_order_id)
+
+        if production_line_id:
+            queryset = queryset.filter(production_order__production_line_id=production_line_id)
+
+        if status_filter:
+            queryset = queryset.filter(status=status_filter)
+
+        return queryset.order_by('-check_date')
+
+    def list(self, request):
+        """Список контролів якості"""
+        queryset = self.get_queryset()
+
+        data = []
+        for check in queryset:
+            data.append({
+                'id': check.id,
+                'production_order': {
+                    'id': check.production_order.id,
+                    'order_number': check.production_order.order_number,
+                    'product': check.production_order.recipe.product.name
+                },
+                'checkpoint': {
+                    'id': check.checkpoint.id,
+                    'name': check.checkpoint.name,
+                    'check_type': check.checkpoint.check_type
+                },
+                'check_date': check.check_date,
+                'checked_quantity': check.checked_quantity,
+                'passed_quantity': check.passed_quantity,
+                'failed_quantity': check.failed_quantity,
+                'defect_rate': check.get_defect_rate(),
+                'status': check.status,
+                'inspector': check.inspector.username if check.inspector else None,
+                'measured_value': check.measured_value,
+                'deviation_percent': check.deviation_percent
+            })
+
+        return StandardResponse.success(data, "Список контролів якості")
+
+    @action(detail=False, methods=['post'])
+    def perform_check(self, request):
+        """Виконання контролю якості"""
+        data = request.data
+
+        service = QualityControlService()
+        service.production_order_id = data.get('production_order')
+
+        try:
+            quality_check = service.perform_quality_check(
+                checkpoint_id=data.get('checkpoint'),
+                checked_quantity=data.get('checked_quantity'),
+                passed_quantity=data.get('passed_quantity'),
+                measured_value=data.get('measured_value'),
+                inspector=request.user,
+                notes=data.get('notes', '')
+            )
+
+            return StandardResponse.success({
+                'id': quality_check.id,
+                'status': quality_check.status,
+                'defect_rate': quality_check.get_defect_rate(),
+                'deviation_percent': quality_check.deviation_percent
+            }, "Контроль якості виконано")
+
+        except Exception as e:
+            return StandardResponse.error(str(e))
+
+    @action(detail=False, methods=['get'])
+    def summary(self, request):
+        """Зведення по якості"""
+        production_line_id = request.query_params.get('production_line')
+        date_from = request.query_params.get('date_from')
+        date_to = request.query_params.get('date_to')
+
+        service = QualityControlService()
+
+        # Конвертуємо дати
+        if date_from:
+            date_from = timezone.datetime.fromisoformat(date_from.replace('Z', '+00:00'))
+        if date_to:
+            date_to = timezone.datetime.fromisoformat(date_to.replace('Z', '+00:00'))
+
+        production_line = None
+        if production_line_id:
+            from .models import ProductionLine
+            production_line = ProductionLine.objects.get(id=production_line_id)
+
+        summary = service.get_quality_summary(production_line, date_from, date_to)
+
+        return StandardResponse.success(summary, "Зведення по якості")
+
+
+class WasteManagementViewSet(ModelViewSet):
+    """API для управління браком та відходами"""
+    queryset = WasteRecord.objects.all()
+    permission_classes = [AllowAny]
+
+    def get_queryset(self):
+        queryset = super().get_queryset()
+
+        production_order_id = self.request.query_params.get('production_order')
+        production_line_id = self.request.query_params.get('production_line')
+        waste_type = self.request.query_params.get('waste_type')
+        cause_category = self.request.query_params.get('cause_category')
+
+        if production_order_id:
+            queryset = queryset.filter(production_order_id=production_order_id)
+
+        if production_line_id:
+            queryset = queryset.filter(production_order__production_line_id=production_line_id)
+
+        if waste_type:
+            queryset = queryset.filter(waste_type__category=waste_type)
+
+        if cause_category:
+            queryset = queryset.filter(cause_category=cause_category)
+
+        return queryset.order_by('-occurred_at')
+
+    def list(self, request):
+        """Список записів про брак/відходи"""
+        queryset = self.get_queryset()
+
+        data = []
+        for record in queryset:
+            data.append({
+                'id': record.id,
+                'production_order': {
+                    'id': record.production_order.id,
+                    'order_number': record.production_order.order_number,
+                    'product': record.production_order.recipe.product.name
+                },
+                'waste_type': {
+                    'id': record.waste_type.id,
+                    'name': record.waste_type.name,
+                    'category': record.waste_type.category
+                },
+                'quantity': record.quantity,
+                'unit': record.unit.name,
+                'unit_cost': record.unit_cost,
+                'total_loss': record.total_loss,
+                'occurred_at': record.occurred_at,
+                'cause_category': record.cause_category,
+                'cause_description': record.cause_description,
+                'is_recovered': record.is_recovered,
+                'recovery_cost': record.recovery_cost,
+                'reported_by': record.reported_by.username if record.reported_by else None
+            })
+
+        return StandardResponse.success(data, "Список браку та відходів")
+
+    @action(detail=False, methods=['post'])
+    def register(self, request):
+        """Реєстрація браку/відходів"""
+        data = request.data
+
+        service = WasteManagementService()
+
+        try:
+            from .models import ProductionOrder, WasteType, WorkCenter
+
+            production_order = ProductionOrder.objects.get(id=data.get('production_order'))
+            waste_type = WasteType.objects.get(id=data.get('waste_type'))
+            work_center = None
+
+            if data.get('work_center'):
+                work_center = WorkCenter.objects.get(id=data.get('work_center'))
+
+            waste_record = service.register_waste(
+                production_order=production_order,
+                waste_type=waste_type,
+                quantity=data.get('quantity'),
+                unit_cost=data.get('unit_cost'),
+                cause_category=data.get('cause_category'),
+                cause_description=data.get('cause_description'),
+                work_center=work_center,
+                reported_by=request.user
+            )
+
+            return StandardResponse.success({
+                'id': waste_record.id,
+                'total_loss': waste_record.total_loss
+            }, "Брак/відходи зареєстровано")
+
+        except Exception as e:
+            return StandardResponse.error(str(e))
+
+    @action(detail=True, methods=['post'])
+    def attempt_recovery(self, request, pk=None):
+        """Спроба відновлення браку"""
+        data = request.data
+        service = WasteManagementService()
+
+        try:
+            result = service.attempt_recovery(
+                waste_record_id=pk,
+                recovery_cost=data.get('recovery_cost'),
+                action_taken=data.get('action_taken'),
+                user=request.user
+            )
+
+            return StandardResponse.success(result, "Спроба відновлення зареєстрована")
+
+        except Exception as e:
+            return StandardResponse.error(str(e))
+
+    @action(detail=False, methods=['get'])
+    def analytics(self, request):
+        """Аналітика по браку та відходам"""
+        company_id = request.query_params.get('company')
+        date_from = request.query_params.get('date_from')
+        date_to = request.query_params.get('date_to')
+
+        service = WasteManagementService()
+
+        # Конвертуємо дати
+        if date_from:
+            date_from = timezone.datetime.fromisoformat(date_from.replace('Z', '+00:00'))
+        if date_to:
+            date_to = timezone.datetime.fromisoformat(date_to.replace('Z', '+00:00'))
+
+        company = None
+        if company_id:
+            from backend.models import Company
+            company = Company.objects.get(id=company_id)
+
+        analytics = service.get_waste_analytics(company, date_from, date_to)
+
+        return StandardResponse.success(analytics, "Аналітика браку та відходів")
+
+
+class WorkTimeNormViewSet(ModelViewSet):
+    """API для управління нормами робочого часу"""
+    queryset = WorkTimeNorm.objects.all()
+    permission_classes = [AllowAny]
+
+    def get_queryset(self):
+        queryset = super().get_queryset()
+
+        production_line_id = self.request.query_params.get('production_line')
+        product_id = self.request.query_params.get('product')
+        is_active = self.request.query_params.get('is_active')
+
+        if production_line_id:
+            queryset = queryset.filter(production_line_id=production_line_id)
+
+        if product_id:
+            queryset = queryset.filter(product_id=product_id)
+
+        if is_active is not None:
+            queryset = queryset.filter(is_active=is_active.lower() == 'true')
+
+        return queryset.order_by('-valid_from')
+
+    def list(self, request):
+        """Список норм робочого часу"""
+        queryset = self.get_queryset()
+
+        data = []
+        for norm in queryset:
+            # Розрахунок для прикладу (100 одиниць)
+            sample_calc = norm.calculate_production_time(100)
+
+            data.append({
+                'id': norm.id,
+                'production_line': {
+                    'id': norm.production_line.id,
+                    'name': norm.production_line.name
+                },
+                'product': {
+                    'id': norm.product.id,
+                    'name': norm.product.name
+                },
+                'setup_time_minutes': norm.setup_time_minutes,
+                'cycle_time_seconds': norm.cycle_time_seconds,
+                'cleanup_time_minutes': norm.cleanup_time_minutes,
+                'efficiency_factor': norm.efficiency_factor,
+                'quality_factor': norm.quality_factor,
+                'is_active': norm.is_active,
+                'valid_from': norm.valid_from,
+                'valid_to': norm.valid_to,
+                'sample_calculation': sample_calc
+            })
+
+        return StandardResponse.success(data, "Список норм робочого часу")
+
+    @action(detail=False, methods=['post'])
+    def create_norm(self, request):
+        """Створення норми робочого часу"""
+        data = request.data
+        service = WorkTimeNormService()
+
+        try:
+            from .models import ProductionLine
+            from backend.models import Product
+
+            production_line = ProductionLine.objects.get(id=data.get('production_line'))
+            product = Product.objects.get(id=data.get('product'))
+
+            time_norm = service.create_time_norm(
+                production_line=production_line,
+                product=product,
+                setup_time=data.get('setup_time_minutes'),
+                cycle_time=data.get('cycle_time_seconds'),
+                cleanup_time=data.get('cleanup_time_minutes'),
+                efficiency_factor=data.get('efficiency_factor', 0.85),
+                quality_factor=data.get('quality_factor', 0.95)
+            )
+
+            return StandardResponse.success({
+                'id': time_norm.id,
+                'production_line': time_norm.production_line.name,
+                'product': time_norm.product.name
+            }, "Норма робочого часу створена")
+
+        except Exception as e:
+            return StandardResponse.error(str(e))
+
+    @action(detail=False, methods=['post'])
+    def calculate_schedule(self, request):
+        """Розрахунок графіку виробництва"""
+        data = request.data
+        order_ids = data.get('order_ids', [])
+
+        service = WorkTimeNormService()
+
+        try:
+            from .models import ProductionOrder
+            orders = ProductionOrder.objects.filter(id__in=order_ids)
+
+            schedule = service.calculate_production_schedule(orders)
+
+            return StandardResponse.success(schedule, "Графік виробництва розраховано")
+
+        except Exception as e:
+            return StandardResponse.error(str(e))
+
+
+class ProductionAnalyticsViewSet:
+    """API для аналітики виробництва"""
+
+    @action(detail=False, methods=['get'])
+    def comprehensive_report(self, request):
+        """Комплексний звіт по виробництву"""
+        company_id = request.query_params.get('company')
+        date_from = request.query_params.get('date_from')
+        date_to = request.query_params.get('date_to')
+
+        if not all([company_id, date_from, date_to]):
+            return StandardResponse.error("Потрібно вказати company, date_from та date_to")
+
+        try:
+            from backend.models import Company
+            company = Company.objects.get(id=company_id)
+
+            # Конвертуємо дати
+            date_from = timezone.datetime.fromisoformat(date_from.replace('Z', '+00:00')).date()
+            date_to = timezone.datetime.fromisoformat(date_to.replace('Z', '+00:00')).date()
+
+            report = ProductionAnalyticsService.get_comprehensive_report(
+                company, date_from, date_to
+            )
+
+            return StandardResponse.success(report, "Комплексний звіт сформовано")
+
+        except Exception as e:
+            return StandardResponse.error(str(e))
+
+    @action(detail=False, methods=['get'])
+    def line_efficiency(self, request):
+        """Ефективність виробничих ліній"""
+        company_id = request.query_params.get('company')
+        days = int(request.query_params.get('days', 30))
+
+        try:
+            from .models import ProductionLine
+
+            queryset = ProductionLine.objects.filter(company_id=company_id, is_active=True)
+
+            data = []
+            for line in queryset:
+                data.append({
+                    'id': line.id,
+                    'name': line.name,
+                    'current_efficiency': line.get_current_efficiency(),
+                    'quality_rate': line.get_quality_rate(days),
+                    'availability_rate': line.get_availability_rate(days),
+                    'oee': line.get_oee(days),
+                    'capacity_per_hour': line.capacity_per_hour,
+                    'maintenance_mode': line.maintenance_mode
+                })
+
+            return StandardResponse.success(data, "Ефективність виробничих ліній")
+
+        except Exception as e:
+            return StandardResponse.error(str(e))
+
+

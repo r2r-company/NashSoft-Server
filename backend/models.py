@@ -1,13 +1,17 @@
+from decimal import Decimal
+
 from django.contrib.auth import get_user_model
 from django.contrib.auth.models import Group
 from django.db import models, transaction
-from django.db.models import Max
+from django.db.models import Max, Sum
 from django.utils.translation import gettext_lazy as _
 from django.db import models
 from django.contrib.postgres.fields import ArrayField
 
 
 # ========== ДОВІДНИКИ ==========
+from backend.exceptions import ValidationError
+
 
 class Company(models.Model):
     name = models.CharField(_('Назва компанії'), max_length=255)
@@ -954,3 +958,320 @@ class DocumentSettings(models.Model):
 
     class Meta:
         verbose_name = "Налаштування документів"
+
+
+class ChartOfAccounts(models.Model):
+    """План рахунків"""
+    code = models.CharField("Код рахунку", max_length=10, unique=True)
+    name = models.CharField("Назва рахунку", max_length=200)
+    parent = models.ForeignKey('self', on_delete=models.CASCADE, null=True, blank=True,
+                               verbose_name="Батьківський рахунок")
+
+    account_type = models.CharField("Тип рахунку", max_length=20, choices=[
+        ('asset', 'Актив'),
+        ('liability', 'Пасив'),
+        ('equity', 'Капітал'),
+        ('revenue', 'Доходи'),
+        ('expense', 'Витрати'),
+    ])
+
+    is_active = models.BooleanField("Активний", default=True)
+    is_analytic = models.BooleanField("Аналітичний", default=False)
+
+    class Meta:
+        verbose_name = "Рахунок"
+        verbose_name_plural = "План рахунків"
+        ordering = ['code']
+
+    def __str__(self):
+        return f"{self.code} - {self.name}"
+
+
+class CostCenter(models.Model):
+    """Центр витрат / фінансової відповідальності"""
+    code = models.CharField("Код ЦВ", max_length=20, unique=True)
+    name = models.CharField("Назва", max_length=200)
+
+    # Ієрархія
+    parent = models.ForeignKey('self', on_delete=models.CASCADE, null=True, blank=True, verbose_name="Батьківський ЦВ")
+
+    # Зв'язки
+    company = models.ForeignKey('Company', on_delete=models.CASCADE)
+    department = models.ForeignKey('Department', on_delete=models.SET_NULL, null=True, blank=True)
+
+    # Тип центру
+    center_type = models.CharField("Тип центру", max_length=20, choices=[
+        ('profit', 'Центр прибутку'),
+        ('cost', 'Центр витрат'),
+        ('revenue', 'Центр доходу'),
+        ('investment', 'Центр інвестицій'),
+    ], default='cost')
+
+    # Бюджет
+    monthly_budget = models.DecimalField("Місячний бюджет", max_digits=15, decimal_places=2, default=0)
+
+    # Відповідальний
+    manager = models.ForeignKey('auth.User', on_delete=models.SET_NULL, null=True, blank=True, verbose_name="Менеджер")
+
+    is_active = models.BooleanField("Активний", default=True)
+
+    class Meta:
+        verbose_name = "Центр витрат"
+        verbose_name_plural = "Центри витрат"
+        ordering = ['code']
+
+    def __str__(self):
+        return f"{self.code} - {self.name}"
+
+    def get_actual_costs(self, date_from, date_to):
+        """Фактичні витрати за період"""
+        return AccountingEntry.objects.filter(
+            cost_center=self,
+            date__range=[date_from, date_to],
+            debit_account__account_type='expense'
+        ).aggregate(Sum('amount'))['amount__sum'] or Decimal('0')
+
+
+class Currency(models.Model):
+    """Валюти"""
+    code = models.CharField("Код валюти", max_length=3, unique=True)  # USD, EUR, UAH
+    name = models.CharField("Назва", max_length=100)
+    symbol = models.CharField("Символ", max_length=5)  # $, €, ₴
+
+    is_base = models.BooleanField("Базова валюта", default=False)
+    is_active = models.BooleanField("Активна", default=True)
+
+    class Meta:
+        verbose_name = "Валюта"
+        verbose_name_plural = "Валюти"
+
+    def __str__(self):
+        return f"{self.code} - {self.name}"
+
+    def save(self, *args, **kwargs):
+        # Тільки одна базова валюта
+        if self.is_base:
+            Currency.objects.filter(is_base=True).update(is_base=False)
+        super().save(*args, **kwargs)
+
+
+class ExchangeRate(models.Model):
+    """Курси валют"""
+    currency = models.ForeignKey(Currency, on_delete=models.CASCADE)
+    date = models.DateField("Дата курсу")
+    rate = models.DecimalField("Курс", max_digits=12, decimal_places=6)
+
+    # Джерело курсу
+    source = models.CharField("Джерело", max_length=20, choices=[
+        ('nbu', 'НБУ'),
+        ('manual', 'Ручне введення'),
+        ('bank', 'Банк'),
+        ('api', 'API сервіс')
+    ], default='nbu')
+
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        verbose_name = "Курс валюти"
+        verbose_name_plural = "Курси валют"
+        unique_together = ('currency', 'date')
+        ordering = ['-date']
+
+    def __str__(self):
+        return f"{self.currency.code}: {self.rate} ({self.date})"
+
+
+class AccountingEntry(models.Model):
+    """Бухгалтерська проводка"""
+    date = models.DateField("Дата проводки")
+    document = models.ForeignKey('Document', on_delete=models.CASCADE, null=True, blank=True)
+
+    debit_account = models.ForeignKey(ChartOfAccounts, on_delete=models.CASCADE, related_name='debit_entries')
+    credit_account = models.ForeignKey(ChartOfAccounts, on_delete=models.CASCADE, related_name='credit_entries')
+
+    amount = models.DecimalField("Сума", max_digits=15, decimal_places=2)
+    description = models.CharField("Опис", max_length=500)
+
+    # Аналітика
+    supplier = models.ForeignKey('Supplier', on_delete=models.SET_NULL, null=True, blank=True)
+    customer = models.ForeignKey('Customer', on_delete=models.SET_NULL, null=True, blank=True)
+    product = models.ForeignKey('Product', on_delete=models.SET_NULL, null=True, blank=True)
+    cost_center = models.ForeignKey(CostCenter, on_delete=models.SET_NULL, null=True, blank=True,
+                                    verbose_name="Центр витрат")
+
+    created_at = models.DateTimeField(auto_now_add=True)
+    urrency = models.ForeignKey(Currency, on_delete=models.CASCADE, default=1)  # UAH по замовчуванню
+    amount_currency = models.DecimalField("Сума у валюті", max_digits=15, decimal_places=2)
+    exchange_rate = models.DecimalField("Курс", max_digits=12, decimal_places=6, default=1)
+    def clean(self):
+        if self.debit_account == self.credit_account:
+            raise ValidationError("Дебет і кредит не можуть бути однаковими")
+        if self.amount <= 0:
+            raise ValidationError("Сума повинна бути більше 0")
+
+    class Meta:
+        verbose_name = "Проводка"
+        verbose_name_plural = "Проводки"
+        ordering = ['-date', '-created_at']
+
+
+class BudgetPeriod(models.Model):
+    """Бюджетний період"""
+    name = models.CharField("Назва періоду", max_length=100)
+    company = models.ForeignKey('Company', on_delete=models.CASCADE)
+
+    start_date = models.DateField("Початок періоду")
+    end_date = models.DateField("Кінець періоду")
+
+    status = models.CharField("Статус", max_length=20, choices=[
+        ('draft', 'Проект'),
+        ('approved', 'Затверджено'),
+        ('active', 'Діючий'),
+        ('closed', 'Закритий')
+    ], default='draft')
+
+    created_by = models.ForeignKey('auth.User', on_delete=models.SET_NULL, null=True)
+    approved_by = models.ForeignKey('auth.User', on_delete=models.SET_NULL, null=True, related_name='approved_budgets')
+    approved_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        verbose_name = "Бюджетний період"
+        verbose_name_plural = "Бюджетні періоди"
+        unique_together = ('company', 'start_date', 'end_date')
+
+    def __str__(self):
+        return f"{self.name} ({self.start_date} - {self.end_date})"
+
+
+class BudgetLine(models.Model):
+    """Статті бюджету"""
+    budget_period = models.ForeignKey(BudgetPeriod, on_delete=models.CASCADE, related_name='lines')
+
+    # Прив'язка
+    account = models.ForeignKey('ChartOfAccounts', on_delete=models.CASCADE)
+    cost_center = models.ForeignKey('CostCenter', on_delete=models.SET_NULL, null=True, blank=True)
+
+    # Бюджетні суми по місяцях
+    jan = models.DecimalField("Січень", max_digits=15, decimal_places=2, default=0)
+    feb = models.DecimalField("Лютий", max_digits=15, decimal_places=2, default=0)
+    mar = models.DecimalField("Березень", max_digits=15, decimal_places=2, default=0)
+    apr = models.DecimalField("Квітень", max_digits=15, decimal_places=2, default=0)
+    may = models.DecimalField("Травень", max_digits=15, decimal_places=2, default=0)
+    jun = models.DecimalField("Червень", max_digits=15, decimal_places=2, default=0)
+    jul = models.DecimalField("Липень", max_digits=15, decimal_places=2, default=0)
+    aug = models.DecimalField("Серпень", max_digits=15, decimal_places=2, default=0)
+    sep = models.DecimalField("Вересень", max_digits=15, decimal_places=2, default=0)
+    oct = models.DecimalField("Жовтень", max_digits=15, decimal_places=2, default=0)
+    nov = models.DecimalField("Листопад", max_digits=15, decimal_places=2, default=0)
+    dec = models.DecimalField("Грудень", max_digits=15, decimal_places=2, default=0)
+
+    notes = models.TextField("Примітки", blank=True)
+
+    class Meta:
+        verbose_name = "Стаття бюджету"
+        verbose_name_plural = "Статті бюджету"
+        unique_together = ('budget_period', 'account', 'cost_center')
+
+    def get_total_budget(self):
+        """Загальний бюджет за рік"""
+        return (self.jan + self.feb + self.mar + self.apr + self.may + self.jun +
+                self.jul + self.aug + self.sep + self.oct + self.nov + self.dec)
+
+    def get_month_budget(self, month):
+        """Бюджет за конкретний місяць"""
+        months = ['jan', 'feb', 'mar', 'apr', 'may', 'jun',
+                  'jul', 'aug', 'sep', 'oct', 'nov', 'dec']
+        return getattr(self, months[month - 1])
+
+
+class CashFlowForecast(models.Model):
+    """Прогноз грошових потоків"""
+    company = models.ForeignKey('Company', on_delete=models.CASCADE)
+    account = models.ForeignKey('settlements.Account', on_delete=models.CASCADE)
+
+    forecast_date = models.DateField("Дата прогнозу")
+    amount = models.DecimalField("Сума", max_digits=15, decimal_places=2)
+
+    flow_type = models.CharField("Тип потоку", max_length=20, choices=[
+        ('inflow', 'Надходження'),
+        ('outflow', 'Витрати')
+    ])
+
+    category = models.CharField("Категорія", max_length=50, choices=[
+        ('sales', 'Продажі'),
+        ('receivables', 'Дебіторка'),
+        ('suppliers', 'Постачальники'),
+        ('salaries', 'Зарплата'),
+        ('taxes', 'Податки'),
+        ('loans', 'Кредити'),
+        ('investments', 'Інвестиції'),
+        ('other', 'Інше')
+    ])
+
+    description = models.CharField("Опис", max_length=200)
+    probability = models.IntegerField("Ймовірність (%)", default=100)
+
+    # Прив'язка до документів
+    document = models.ForeignKey('Document', on_delete=models.SET_NULL, null=True, blank=True)
+    customer = models.ForeignKey('Customer', on_delete=models.SET_NULL, null=True, blank=True)
+    supplier = models.ForeignKey('Supplier', on_delete=models.SET_NULL, null=True, blank=True)
+
+    is_actual = models.BooleanField("Фактичний", default=False)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        verbose_name = "Прогноз cashflow"
+        verbose_name_plural = "Прогнози cashflow"
+        ordering = ['forecast_date']
+
+    def __str__(self):
+        return f"{self.forecast_date}: {self.amount} ({self.category})"
+
+
+class PaymentSchedule(models.Model):
+    """Графік платежів"""
+    company = models.ForeignKey('Company', on_delete=models.CASCADE)
+
+    # Тип графіку
+    schedule_type = models.CharField("Тип", max_length=20, choices=[
+        ('receivables', 'Дебіторська заборгованість'),
+        ('payables', 'Кредиторська заборгованість'),
+        ('loan', 'Кредитні платежі'),
+        ('lease', 'Орендні платежі'),
+        ('recurring', 'Регулярні платежі')
+    ])
+
+    # Деталі
+    counterparty_name = models.CharField("Контрагент", max_length=200)
+    amount = models.DecimalField("Сума", max_digits=15, decimal_places=2)
+    due_date = models.DateField("Дата погашення")
+
+    # Статус
+    status = models.CharField("Статус", max_length=20, choices=[
+        ('planned', 'Заплановано'),
+        ('overdue', 'Прострочено'),
+        ('paid', 'Сплачено'),
+        ('cancelled', 'Скасовано')
+    ], default='planned')
+
+    paid_amount = models.DecimalField("Сплачено", max_digits=15, decimal_places=2, default=0)
+    paid_date = models.DateField("Дата оплати", null=True, blank=True)
+
+    # Прив'язки
+    document = models.ForeignKey('Document', on_delete=models.SET_NULL, null=True, blank=True)
+    customer = models.ForeignKey('Customer', on_delete=models.SET_NULL, null=True, blank=True)
+    supplier = models.ForeignKey('Supplier', on_delete=models.SET_NULL, null=True, blank=True)
+
+    notes = models.TextField("Примітки", blank=True)
+
+    class Meta:
+        verbose_name = "Графік платежів"
+        verbose_name_plural = "Графіки платежів"
+        ordering = ['due_date']
+
+    def __str__(self):
+        return f"{self.counterparty_name}: {self.amount} ({self.due_date})"
+
+    def is_overdue(self):
+        from django.utils import timezone
+        return self.status == 'planned' and self.due_date < timezone.now().date()

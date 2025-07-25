@@ -1,4 +1,4 @@
-# backend/admin/admin_group_titles.py - ПРОСТА РЕОРГАНІЗАЦІЯ
+# backend/admin/admin_group_titles.py - ВИПРАВИ НАЗВИ
 
 GROUP_TITLES = {
     # 🏢 ОСНОВА (найважливіше для роботи)
@@ -32,11 +32,22 @@ GROUP_TITLES = {
     "PriceSettingDocument": "💰 Ціни та знижки",
     "DiscountRule": "💰 Ціни та знижки",
 
-    # 💵 ФІНАНСИ
+    # 💵 ФІНАНСИ (старі моделі)
     "Account": "💵 Каса та банк",
     "MoneyDocument": "💵 Каса та банк",
     "MoneyOperation": "💵 Каса та банк",
     "MoneyLedgerEntry": "💵 Каса та банк",
+
+    # 📊 БУХГАЛТЕРСЬКИЙ ОБЛІК (нові моделі)
+    "ChartOfAccounts": "📊 Бухгалтерський облік",
+    "AccountingEntry": "📊 Бухгалтерський облік",
+    "CostCenter": "📊 Бухгалтерський облік",
+    "Currency": "📊 Бухгалтерський облік",
+    "ExchangeRate": "📊 Бухгалтерський облік",
+    "BudgetPeriod": "📊 Бухгалтерський облік",
+    "BudgetLine": "📊 Бухгалтерський облік",
+    "CashFlowForecast": "📊 Бухгалтерський облік",
+    "PaymentSchedule": "📊 Бухгалтерський облік",
 
     # 🖨️ КАСИ
     "CashRegister": "🖨️ Касові апарати",
@@ -59,6 +70,15 @@ GROUP_TITLES = {
     "WorkerPosition": "🏭 Виробництво",
     "ProductionWorker": "🏭 Виробництво",
     "WorkShift": "🏭 Виробництво",
+
+    # 🔧 НОВІ МОДЕЛІ ВИРОБНИЦТВА
+    "MaintenanceType": "🏭 Виробництво",
+    "MaintenanceSchedule": "🏭 Виробництво",
+    "QualityCheckPoint": "🏭 Виробництво",
+    "QualityCheck": "🏭 Виробництво",
+    "WasteType": "🏭 Виробництво",
+    "WasteRecord": "🏭 Виробництво",
+    "WorkTimeNorm": "🏭 Виробництво",
 
     # 👨‍💻 КОРИСТУВАЧІ
     "AppUser": "👨‍💻 Користувачі та права",

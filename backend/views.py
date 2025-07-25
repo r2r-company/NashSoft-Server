@@ -1,3 +1,4 @@
+from datetime import date, timedelta
 from decimal import Decimal
 
 import documents
@@ -17,15 +18,20 @@ from django.db.models import Sum, Case, When, Value, DecimalField, F
 from backend.auth import CustomLoginSerializer
 from backend.models import Operation, Document, PriceSettingDocument, AppUser, Product, Company, \
     Warehouse, Customer, Supplier, ProductGroup, Unit, PaymentType, Firm, Department, CustomerType, PriceType, \
-    Interface, TradePoint, ProductUnitConversion, PriceSettingItem
+    Interface, TradePoint, ProductUnitConversion, PriceSettingItem, BudgetPeriod, ExchangeRate
 from backend.operations.stock import FIFOStockManager
 from backend.serializers import DocumentSerializer, DocumentListSerializer, PriceSettingDocumentSerializer, \
     ProductSerializer, CompanySerializer, WarehouseSerializer, CustomerSerializer, SupplierSerializer, \
     ProductGroupSerializer, PaymentTypeSerializer, FirmSerializer, DepartmentSerializer, AccountSerializer, \
     TechCalculationSerializer, ProductGroupFlatSerializer, CustomerTypeSerializer, PriceTypeSerializer, \
     InterfaceSerializer, UnitSerializer, AppUserSerializer, TradePointSerializer, ProductUnitConversionSerializer
+from backend.services.budget import BudgetService
+from backend.services.cashflow import CashFlowService
+from backend.services.cost_center import CostCenterService
+from backend.services.currency import CurrencyService
 from backend.services.document_services import SaleService, ReceiptService, InventoryInService
 from backend.services.factory import get_document_service
+from backend.services.financial_reports import FinancialReportsService
 from backend.services.logger import AuditLoggerService
 from backend.services.price import get_price_from_setting, get_all_prices_for_product
 from backend.services.tech_calc import TechCalculationService
@@ -2163,3 +2169,201 @@ def get_product_packaging(request, product_id):
             'success': False,
             'error': str(e)
         }, status=500)
+
+
+
+class TrialBalanceView(APIView):
+    """Оборотно-сальдова відомість"""
+    permission_classes = [AllowAny]
+
+    def get(self, request):
+        company_id = request.query_params.get('company')
+        date_to = request.query_params.get('date_to', date.today())
+
+        try:
+            from .models import Company
+            company = Company.objects.get(id=company_id)
+
+            balance = FinancialReportsService.get_trial_balance(company, date_to)
+            return StandardResponse.success(balance, "Оборотно-сальдова відомість")
+
+        except Exception as e:
+            return StandardResponse.error(str(e))
+
+
+class BalanceSheetView(APIView):
+    """Бухгалтерський баланс"""
+    permission_classes = [AllowAny]
+
+    def get(self, request):
+        company_id = request.query_params.get('company')
+        date_to = request.query_params.get('date_to', date.today())
+
+        try:
+            from .models import Company
+            company = Company.objects.get(id=company_id)
+
+            balance_sheet = FinancialReportsService.get_balance_sheet(company, date_to)
+            return StandardResponse.success(balance_sheet, "Бухгалтерський баланс")
+
+        except Exception as e:
+            return StandardResponse.error(str(e))
+
+
+class ProfitLossView(APIView):
+    """Звіт про прибутки та збитки"""
+    permission_classes = [AllowAny]
+
+    def get(self, request):
+        company_id = request.query_params.get('company')
+        date_from = request.query_params.get('date_from')
+        date_to = request.query_params.get('date_to')
+
+        if not all([company_id, date_from, date_to]):
+            return StandardResponse.error("Потрібно вказати company, date_from, date_to")
+
+        try:
+            from .models import Company
+            company = Company.objects.get(id=company_id)
+
+            report = FinancialReportsService.get_profit_loss(company, date_from, date_to)
+            return StandardResponse.success(report, "Звіт про прибутки та збитки")
+
+        except Exception as e:
+            return StandardResponse.error(str(e))
+
+
+class CostCenterAnalysisView(APIView):
+    """Аналіз по центрах витрат"""
+    permission_classes = [AllowAny]
+
+    def get(self, request):
+        company_id = request.query_params.get('company')
+        date_from = request.query_params.get('date_from')
+        date_to = request.query_params.get('date_to')
+
+        try:
+            from .models import Company
+            company = Company.objects.get(id=company_id)
+
+            analysis = CostCenterService.get_cost_analysis(company, date_from, date_to)
+            return StandardResponse.success(analysis, "Аналіз центрів витрат")
+
+        except Exception as e:
+            return StandardResponse.error(str(e))
+
+
+class ExchangeRatesView(APIView):
+    """Курси валют"""
+    permission_classes = [AllowAny]
+
+    def get(self, request):
+        """Поточні курси"""
+        try:
+            rates = ExchangeRate.objects.filter(
+                date=date.today()
+            ).select_related('currency')
+
+            data = [{
+                'currency_code': rate.currency.code,
+                'currency_name': rate.currency.name,
+                'rate': rate.rate,
+                'date': rate.date,
+                'source': rate.source
+            } for rate in rates]
+
+            return StandardResponse.success(data, "Курси валют")
+
+        except Exception as e:
+            return StandardResponse.error(str(e))
+
+    def post(self, request):
+        """Оновлення курсів з НБУ"""
+        try:
+            result = CurrencyService.get_nbu_rates()
+
+            if result['success']:
+                return StandardResponse.success(
+                    {'updated_rates': result['created']},
+                    f"Оновлено {result['created']} курсів"
+                )
+            else:
+                return StandardResponse.error(result['error'])
+
+        except Exception as e:
+            return StandardResponse.error(str(e))
+
+
+class BudgetExecutionView(APIView):
+    """Виконання бюджету"""
+    permission_classes = [AllowAny]
+
+    def get(self, request):
+        budget_period_id = request.query_params.get('budget_period')
+
+        try:
+
+            budget_period = BudgetPeriod.objects.get(id=budget_period_id)
+
+            execution = BudgetService.get_budget_execution(budget_period)
+            return StandardResponse.success(execution, "Виконання бюджету")
+
+        except Exception as e:
+            return StandardResponse.error(str(e))
+
+
+class CashFlowForecastView(APIView):
+    """Прогноз грошових потоків"""
+    permission_classes = [AllowAny]
+
+    def get(self, request):
+        company_id = request.query_params.get('company')
+        date_from = request.query_params.get('date_from', date.today())
+        date_to = request.query_params.get('date_to')
+
+        if not date_to:
+            date_to = date.today() + timedelta(days=90)
+
+        try:
+            from .models import Company
+            company = Company.objects.get(id=company_id)
+
+            forecast = CashFlowService.get_cashflow_report(company, date_from, date_to)
+            return StandardResponse.success(forecast, "Прогноз cashflow")
+
+        except Exception as e:
+            return StandardResponse.error(str(e))
+
+    def post(self, request):
+        """Генерація прогнозу"""
+        company_id = request.data.get('company')
+        days_ahead = request.data.get('days_ahead', 90)
+
+        try:
+            from .models import Company
+            company = Company.objects.get(id=company_id)
+
+            CashFlowService.generate_forecast(company, days_ahead)
+            return StandardResponse.success(None, "Прогноз згенеровано")
+
+        except Exception as e:
+            return StandardResponse.error(str(e))
+
+
+class LiquidityRiskView(APIView):
+    """Аналіз ризику ліквідності"""
+    permission_classes = [AllowAny]
+
+    def get(self, request):
+        company_id = request.query_params.get('company')
+        days_ahead = int(request.query_params.get('days_ahead', 30))
+
+        try:
+            from .models import Company
+            company = Company.objects.get(id=company_id)
+
+            risk_analysis = CashFlowService.check_liquidity_risk(company, days_ahead)
+            return StandardResponse.success(risk_analysis, "Аналіз ризику ліквідності")
+
+        except Exception as e:
+            return StandardResponse.error(str(e))

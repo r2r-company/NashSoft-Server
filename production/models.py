@@ -625,3 +625,706 @@ class ProductionOrder(models.Model):
         if self.status in ['completed', 'cancelled']:
             return False
         return timezone.now() > self.due_date
+
+
+# production/models.py - ДОДАТКОВІ МОДЕЛІ ДЛЯ ПОВНОГО ФУНКЦІОНАЛУ
+
+from django.db import models
+from django.contrib.auth import get_user_model
+from django.utils import timezone
+from datetime import timedelta
+from decimal import Decimal
+
+User = get_user_model()
+
+
+# ========== ПЛАНУВАННЯ ТО ТА РЕМОНТІВ ==========
+
+class MaintenanceType(models.Model):
+    """Типи технічного обслуговування"""
+    name = models.CharField("Назва ТО", max_length=100)
+    description = models.TextField("Опис", blank=True)
+
+    # Періодичність
+    frequency_type = models.CharField(
+        "Тип періодичності",
+        max_length=20,
+        choices=[
+            ('hours', 'По мотогодинах'),
+            ('days', 'По днях'),
+            ('cycles', 'По циклах роботи'),
+            ('manual', 'Ручне планування')
+        ],
+        default='days'
+    )
+    frequency_value = models.IntegerField("Значення періодичності", default=30)
+
+    # Тривалість ТО
+    duration_hours = models.DecimalField("Тривалість (год)", max_digits=6, decimal_places=2, default=2)
+
+    # Вартість
+    estimated_cost = models.DecimalField("Планова вартість", max_digits=10, decimal_places=2, default=0)
+
+    is_active = models.BooleanField("Активний", default=True)
+
+    class Meta:
+        verbose_name = "Тип ТО"
+        verbose_name_plural = "Типи ТО"
+
+    def __str__(self):
+        return self.name
+
+
+class MaintenanceSchedule(models.Model):
+    """Графік планового ТО"""
+    production_line = models.ForeignKey(
+        'ProductionLine',
+        on_delete=models.CASCADE,
+        related_name='maintenance_schedules',
+        verbose_name="Виробнича лінія"
+    )
+    maintenance_type = models.ForeignKey(
+        MaintenanceType,
+        on_delete=models.CASCADE,
+        verbose_name="Тип ТО"
+    )
+
+    # Планування
+    scheduled_date = models.DateTimeField("Планова дата")
+    estimated_duration = models.DecimalField("Планова тривалість (год)", max_digits=6, decimal_places=2)
+
+    # Статус
+    STATUS_CHOICES = [
+        ('scheduled', 'Заплановано'),
+        ('in_progress', 'Виконується'),
+        ('completed', 'Завершено'),
+        ('cancelled', 'Скасовано'),
+        ('overdue', 'Прострочено'),
+    ]
+    status = models.CharField("Статус", max_length=20, choices=STATUS_CHOICES, default='scheduled')
+
+    # Виконання
+    actual_start = models.DateTimeField("Фактичний початок", null=True, blank=True)
+    actual_end = models.DateTimeField("Фактичне завершення", null=True, blank=True)
+    actual_cost = models.DecimalField("Фактична вартість", max_digits=10, decimal_places=2, default=0)
+
+    # Відповідальні
+    assigned_to = models.ForeignKey(
+        User,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        verbose_name="Відповідальний"
+    )
+
+    # Результат
+    completion_notes = models.TextField("Примітки по виконанню", blank=True)
+    next_maintenance_date = models.DateTimeField("Наступне ТО", null=True, blank=True)
+
+    created_at = models.DateTimeField("Створено", auto_now_add=True)
+
+    class Meta:
+        verbose_name = "График ТО"
+        verbose_name_plural = "Графіки ТО"
+        ordering = ['scheduled_date']
+
+    def __str__(self):
+        return f"{self.production_line.name} - {self.maintenance_type.name} ({self.scheduled_date.date()})"
+
+    def is_overdue(self):
+        """Перевірка чи прострочено ТО"""
+        if self.status in ['completed', 'cancelled']:
+            return False
+        return timezone.now() > self.scheduled_date
+
+    def get_actual_duration(self):
+        """Фактична тривалість ТО"""
+        if self.actual_start and self.actual_end:
+            delta = self.actual_end - self.actual_start
+            return round(delta.total_seconds() / 3600, 2)  # в годинах
+        return None
+
+
+# ========== КОНТРОЛЬ ЯКОСТІ ==========
+
+class QualityCheckPoint(models.Model):
+    """Контрольні точки якості"""
+    name = models.CharField("Назва контрольної точки", max_length=200)
+    production_line = models.ForeignKey(
+        'ProductionLine',
+        on_delete=models.CASCADE,
+        related_name='quality_checkpoints',
+        verbose_name="Виробнича лінія"
+    )
+
+    # Тип перевірки
+    check_type = models.CharField(
+        "Тип перевірки",
+        max_length=20,
+        choices=[
+            ('visual', 'Візуальний контроль'),
+            ('measurement', 'Вимірювання'),
+            ('testing', 'Тестування'),
+            ('sampling', 'Вибіркова перевірка'),
+        ],
+        default='visual'
+    )
+
+    # Параметри
+    check_frequency = models.CharField(
+        "Частота перевірки",
+        max_length=20,
+        choices=[
+            ('each', 'Кожна одиниця'),
+            ('batch', 'Кожна партія'),
+            ('hour', 'Кожну годину'),
+            ('shift', 'Кожну зміну'),
+        ],
+        default='batch'
+    )
+
+    # Критерії
+    criteria = models.TextField("Критерії якості")
+    acceptable_deviation = models.DecimalField(
+        "Допустиме відхилення (%)",
+        max_digits=5,
+        decimal_places=2,
+        default=5
+    )
+
+    is_active = models.BooleanField("Активна", default=True)
+
+    class Meta:
+        verbose_name = "Контрольна точка"
+        verbose_name_plural = "Контрольні точки"
+
+    def __str__(self):
+        return f"{self.name} ({self.production_line.name})"
+
+
+class QualityCheck(models.Model):
+    """Результати контролю якості"""
+    production_order = models.ForeignKey(
+        'ProductionOrder',
+        on_delete=models.CASCADE,
+        related_name='quality_checks',
+        verbose_name="Виробниче замовлення"
+    )
+    checkpoint = models.ForeignKey(
+        QualityCheckPoint,
+        on_delete=models.CASCADE,
+        verbose_name="Контрольна точка"
+    )
+
+    # Результати
+    check_date = models.DateTimeField("Дата перевірки", default=timezone.now)
+    checked_quantity = models.DecimalField("Перевірено (шт)", max_digits=10, decimal_places=3)
+    passed_quantity = models.DecimalField("Пройшло контроль", max_digits=10, decimal_places=3)
+    failed_quantity = models.DecimalField("Не пройшло контроль", max_digits=10, decimal_places=3, default=0)
+
+    # Деталі
+    measured_value = models.DecimalField("Виміряне значення", max_digits=10, decimal_places=3, null=True, blank=True)
+    deviation_percent = models.DecimalField("Відхилення (%)", max_digits=5, decimal_places=2, default=0)
+
+    # Статус
+    STATUS_CHOICES = [
+        ('pass', 'Пройшов'),
+        ('fail', 'Не пройшов'),
+        ('conditional', 'Умовно пройшов'),
+    ]
+    status = models.CharField("Статус", max_length=20, choices=STATUS_CHOICES, default='pass')
+
+    # Відповідальний та примітки
+    inspector = models.ForeignKey(
+        User,
+        on_delete=models.SET_NULL,
+        null=True,
+        verbose_name="Контролер"
+    )
+    notes = models.TextField("Примітки", blank=True)
+
+    class Meta:
+        verbose_name = "Контроль якості"
+        verbose_name_plural = "Контроль якості"
+        ordering = ['-check_date']
+
+    def __str__(self):
+        return f"{self.checkpoint.name} - {self.check_date.date()} ({self.status})"
+
+    def get_defect_rate(self):
+        """Відсоток браку"""
+        if self.checked_quantity > 0:
+            return round((self.failed_quantity / self.checked_quantity) * 100, 2)
+        return 0
+
+
+# ========== ОБЛІК БРАКУ ТА ВІДХОДІВ ==========
+
+class WasteType(models.Model):
+    """Типи браку та відходів"""
+    name = models.CharField("Назва типу", max_length=100)
+    category = models.CharField(
+        "Категорія",
+        max_length=20,
+        choices=[
+            ('defect', 'Брак'),
+            ('waste', 'Відходи'),
+            ('rework', 'На доробку'),
+        ],
+        default='defect'
+    )
+
+    # Фінансові показники
+    is_recoverable = models.BooleanField("Можна відновити", default=False)
+    recovery_cost_per_unit = models.DecimalField(
+        "Вартість відновлення за од.",
+        max_digits=10,
+        decimal_places=2,
+        default=0
+    )
+
+    description = models.TextField("Опис", blank=True)
+
+    class Meta:
+        verbose_name = "Тип браку/відходів"
+        verbose_name_plural = "Типи браку та відходів"
+
+    def __str__(self):
+        return f"{self.name} ({self.get_category_display()})"
+
+
+class WasteRecord(models.Model):
+    """Облік браку та відходів"""
+    production_order = models.ForeignKey(
+        'ProductionOrder',
+        on_delete=models.CASCADE,
+        related_name='waste_records',
+        verbose_name="Виробниче замовлення"
+    )
+    waste_type = models.ForeignKey(
+        WasteType,
+        on_delete=models.CASCADE,
+        verbose_name="Тип браку/відходів"
+    )
+
+    # Кількісні показники
+    quantity = models.DecimalField("Кількість", max_digits=10, decimal_places=3)
+    unit = models.ForeignKey(
+        'backend.Unit',
+        on_delete=models.CASCADE,
+        verbose_name="Одиниця виміру"
+    )
+
+    # Фінансові показники
+    unit_cost = models.DecimalField("Собівартість за од.", max_digits=10, decimal_places=2)
+    total_loss = models.DecimalField("Загальні втрати", max_digits=12, decimal_places=2)
+
+    # Деталі
+    occurred_at = models.DateTimeField("Час виявлення", default=timezone.now)
+    work_center = models.ForeignKey(
+        'WorkCenter',
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        verbose_name="Робочий центр"
+    )
+
+    # Причини
+    cause_category = models.CharField(
+        "Категорія причини",
+        max_length=20,
+        choices=[
+            ('material', 'Сировина'),
+            ('equipment', 'Обладнання'),
+            ('process', 'Технологічний процес'),
+            ('human', 'Людський фактор'),
+            ('environment', 'Зовнішні фактори'),
+        ],
+        default='process'
+    )
+    cause_description = models.TextField("Опис причини")
+
+    # Дії
+    action_taken = models.TextField("Вжиті заходи", blank=True)
+    is_recovered = models.BooleanField("Відновлено", default=False)
+    recovery_cost = models.DecimalField("Вартість відновлення", max_digits=10, decimal_places=2, default=0)
+
+    # Відповідальний
+    reported_by = models.ForeignKey(
+        User,
+        on_delete=models.SET_NULL,
+        null=True,
+        verbose_name="Хто повідомив"
+    )
+
+    class Meta:
+        verbose_name = "Запис про брак/відходи"
+        verbose_name_plural = "Облік браку та відходів"
+        ordering = ['-occurred_at']
+
+    def __str__(self):
+        return f"{self.waste_type.name} - {self.quantity} {self.unit.name} ({self.occurred_at.date()})"
+
+
+# ========== НОРМУВАННЯ РОБОЧОГО ЧАСУ ==========
+
+class WorkTimeNorm(models.Model):
+    """Норми робочого часу"""
+    production_line = models.ForeignKey(
+        'ProductionLine',
+        on_delete=models.CASCADE,
+        related_name='time_norms',
+        verbose_name="Виробнича лінія"
+    )
+    product = models.ForeignKey(
+        'backend.Product',
+        on_delete=models.CASCADE,
+        verbose_name="Продукт"
+    )
+
+    # Норми часу
+    setup_time_minutes = models.DecimalField(
+        "Час налаштування (хв)",
+        max_digits=8,
+        decimal_places=2,
+        default=0,
+        help_text="Час на підготовку лінії для виробництва"
+    )
+    cycle_time_seconds = models.DecimalField(
+        "Час циклу (сек)",
+        max_digits=8,
+        decimal_places=2,
+        help_text="Час виробництва однієї одиниці"
+    )
+    cleanup_time_minutes = models.DecimalField(
+        "Час прибирання (хв)",
+        max_digits=8,
+        decimal_places=2,
+        default=0,
+        help_text="Час на прибирання після завершення"
+    )
+
+    # Коефіцієнти
+    efficiency_factor = models.DecimalField(
+        "Коефіцієнт ефективності",
+        max_digits=4,
+        decimal_places=3,
+        default=0.85,
+        help_text="Врахування втрат часу (0.85 = 85% ефективність)"
+    )
+    quality_factor = models.DecimalField(
+        "Коефіцієнт якості",
+        max_digits=4,
+        decimal_places=3,
+        default=0.95,
+        help_text="Врахування браку (0.95 = 5% брак)"
+    )
+
+    # Метадані
+    valid_from = models.DateTimeField("Діє з", default=timezone.now)
+    valid_to = models.DateTimeField("Діє до", null=True, blank=True)
+    is_active = models.BooleanField("Активна", default=True)
+
+    class Meta:
+        verbose_name = "Норма робочого часу"
+        verbose_name_plural = "Норми робочого часу"
+        unique_together = ('production_line', 'product', 'valid_from')
+
+    def __str__(self):
+        return f"{self.production_line.name} - {self.product.name}"
+
+    def calculate_production_time(self, quantity):
+        """Розрахунок часу виробництва для заданої кількості"""
+        # Час налаштування (разово)
+        setup = float(self.setup_time_minutes)
+
+        # Час виробництва
+        production = (float(quantity) * float(self.cycle_time_seconds)) / 60  # в хвилинах
+
+        # Час прибирання (разово)
+        cleanup = float(self.cleanup_time_minutes)
+
+        # Загальний час з коефіцієнтами
+        total_minutes = (setup + production + cleanup) / float(self.efficiency_factor)
+
+        return {
+            'setup_minutes': setup,
+            'production_minutes': production,
+            'cleanup_minutes': cleanup,
+            'total_minutes': round(total_minutes, 2),
+            'total_hours': round(total_minutes / 60, 2)
+        }
+
+
+# ========== РОЗШИРЕННЯ ІСНУЮЧИХ МОДЕЛЕЙ ==========
+
+# Додаємо методи до ProductionLine
+class ProductionLineExtended:
+    """Розширення для ProductionLine"""
+
+    def get_current_efficiency(self):
+        """РЕАЛЬНИЙ розрахунок ефективності лінії"""
+        from django.db.models import Avg, Sum
+        from datetime import datetime, timedelta
+
+        # Аналізуємо останні 30 днів
+        end_date = timezone.now()
+        start_date = end_date - timedelta(days=30)
+
+        # Отримуємо завершені замовлення
+        completed_orders = self.production_orders.filter(
+            status='completed',
+            completed_at__range=[start_date, end_date]
+        )
+
+        if not completed_orders.exists():
+            return 0.0
+
+        total_efficiency = 0
+        count = 0
+
+        for order in completed_orders:
+            # Розрахунок ефективності для кожного замовлення
+            planned_time = order.planned_duration_hours or 8
+            actual_time = order.get_actual_duration_hours() or planned_time
+
+            if actual_time > 0:
+                efficiency = min(100, (planned_time / actual_time) * 100)
+                total_efficiency += efficiency
+                count += 1
+
+        return round(total_efficiency / count, 1) if count > 0 else 0.0
+
+    def get_quality_rate(self, days=30):
+        """Показник якості за період"""
+        from datetime import timedelta
+
+        end_date = timezone.now()
+        start_date = end_date - timedelta(days=days)
+
+        # Збираємо дані по контролю якості
+        quality_checks = QualityCheck.objects.filter(
+            production_order__production_line=self,
+            check_date__range=[start_date, end_date]
+        )
+
+        if not quality_checks.exists():
+            return 100.0
+
+        total_checked = sum(check.checked_quantity for check in quality_checks)
+        total_passed = sum(check.passed_quantity for check in quality_checks)
+
+        if total_checked > 0:
+            return round((total_passed / total_checked) * 100, 2)
+        return 100.0
+
+    def get_availability_rate(self, days=30):
+        """Коефіцієнт доступності (без ТО та простоїв)"""
+        from datetime import timedelta
+
+        end_date = timezone.now()
+        start_date = end_date - timedelta(days=days)
+
+        # Загальний час періоду
+        total_hours = days * 24
+
+        # Час простоїв через ТО
+        maintenance_hours = MaintenanceSchedule.objects.filter(
+            production_line=self,
+            status='completed',
+            actual_start__range=[start_date, end_date]
+        ).aggregate(
+            total=Sum('estimated_duration')
+        )['total'] or 0
+
+        # Час простоїв через поломки (можна додати окрему модель)
+        breakdown_hours = 0  # TODO: додати модель Breakdown
+
+        # Доступність
+        downtime_hours = float(maintenance_hours) + breakdown_hours
+        availability = max(0, (total_hours - downtime_hours) / total_hours * 100)
+
+        return round(availability, 2)
+
+    def get_oee(self, days=30):
+        """Overall Equipment Effectiveness"""
+        availability = self.get_availability_rate(days) / 100
+        performance = self.get_current_efficiency() / 100
+        quality = self.get_quality_rate(days) / 100
+
+        oee = availability * performance * quality * 100
+        return round(oee, 2)
+
+    def schedule_next_maintenance(self):
+        """Автоматичне планування наступного ТО"""
+        # Знаходимо всі типи ТО для цієї лінії
+        maintenance_types = MaintenanceType.objects.filter(is_active=True)
+
+        for mt in maintenance_types:
+            # Знаходимо останнє ТО цього типу
+            last_maintenance = MaintenanceSchedule.objects.filter(
+                production_line=self,
+                maintenance_type=mt,
+                status='completed'
+            ).order_by('-actual_end').first()
+
+            if last_maintenance:
+                next_date = self._calculate_next_maintenance_date(last_maintenance, mt)
+            else:
+                # Перше ТО - через місяць
+                next_date = timezone.now() + timedelta(days=30)
+
+            # Створюємо запис якщо його ще немає
+            existing = MaintenanceSchedule.objects.filter(
+                production_line=self,
+                maintenance_type=mt,
+                status='scheduled'
+            ).exists()
+
+            if not existing:
+                MaintenanceSchedule.objects.create(
+                    production_line=self,
+                    maintenance_type=mt,
+                    scheduled_date=next_date,
+                    estimated_duration=mt.duration_hours
+                )
+
+    def _calculate_next_maintenance_date(self, last_maintenance, maintenance_type):
+        """Розрахунок дати наступного ТО"""
+        if maintenance_type.frequency_type == 'days':
+            return last_maintenance.actual_end + timedelta(days=maintenance_type.frequency_value)
+        elif maintenance_type.frequency_type == 'hours':
+            # TODO: облік мотогодин
+            return last_maintenance.actual_end + timedelta(days=maintenance_type.frequency_value)
+        else:
+            return last_maintenance.actual_end + timedelta(days=30)
+
+
+# Патчимо існуючу модель
+def patch_production_line():
+    """Додаємо нові методи до існуючої моделі ProductionLine"""
+    from production.models import ProductionLine
+
+    ProductionLine.get_current_efficiency = ProductionLineExtended.get_current_efficiency
+    ProductionLine.get_quality_rate = ProductionLineExtended.get_quality_rate
+    ProductionLine.get_availability_rate = ProductionLineExtended.get_availability_rate
+    ProductionLine.get_oee = ProductionLineExtended.get_oee
+    ProductionLine.schedule_next_maintenance = ProductionLineExtended.schedule_next_maintenance
+    ProductionLine._calculate_next_maintenance_date = ProductionLineExtended._calculate_next_maintenance_date
+
+
+# Додаємо методи до ProductionOrder
+class ProductionOrderExtended:
+    """Розширення для ProductionOrder"""
+
+    def get_actual_duration_hours(self):
+        """Фактична тривалість виробництва"""
+        if self.actual_start and self.actual_end:
+            delta = self.actual_end - self.actual_start
+            return round(delta.total_seconds() / 3600, 2)
+        elif self.actual_start:
+            # Ще не завершено, рахуємо від початку
+            delta = timezone.now() - self.actual_start
+            return round(delta.total_seconds() / 3600, 2)
+        return 0
+
+    def calculate_planned_duration(self):
+        """Розрахунок планової тривалості на основі норм"""
+        try:
+            # Знаходимо норму часу
+            time_norm = WorkTimeNorm.objects.filter(
+                production_line=self.production_line,
+                product=self.recipe.product,
+                is_active=True
+            ).first()
+
+            if time_norm:
+                time_calc = time_norm.calculate_production_time(self.quantity_ordered)
+                self.planned_duration_hours = time_calc['total_hours']
+                self.save()
+                return time_calc
+            else:
+                # Фолбек на базову формулу
+                if self.production_line.capacity_per_hour > 0:
+                    hours = float(self.quantity_ordered) / float(self.production_line.capacity_per_hour)
+                    self.planned_duration_hours = round(hours, 2)
+                    self.save()
+                    return {'total_hours': hours}
+
+        except Exception as e:
+            print(f"Помилка розрахунку планової тривалості: {e}")
+            return {'total_hours': 8}  # Фолбек на 8 годин
+
+    def get_efficiency_percent(self):
+        """Ефективність виконання замовлення"""
+        if self.planned_duration_hours and self.get_actual_duration_hours():
+            planned = float(self.planned_duration_hours)
+            actual = self.get_actual_duration_hours()
+            if actual > 0:
+                return round((planned / actual) * 100, 1)
+        return 0.0
+
+    def get_quality_summary(self):
+        """Зведення по якості"""
+        checks = self.quality_checks.all()
+        if not checks:
+            return {'total_checked': 0, 'passed_rate': 100, 'defect_rate': 0}
+
+        total_checked = sum(check.checked_quantity for check in checks)
+        total_passed = sum(check.passed_quantity for check in checks)
+        total_failed = sum(check.failed_quantity for check in checks)
+
+        passed_rate = (total_passed / total_checked * 100) if total_checked > 0 else 100
+        defect_rate = (total_failed / total_checked * 100) if total_checked > 0 else 0
+
+        return {
+            'total_checked': total_checked,
+            'total_passed': total_passed,
+            'total_failed': total_failed,
+            'passed_rate': round(passed_rate, 2),
+            'defect_rate': round(defect_rate, 2)
+        }
+
+    def get_waste_summary(self):
+        """Зведення по відходах та браку"""
+        waste_records = self.waste_records.all()
+
+        total_loss = sum(record.total_loss for record in waste_records)
+        total_quantity = sum(record.quantity for record in waste_records)
+
+        waste_by_type = {}
+        for record in waste_records:
+            category = record.waste_type.category
+            if category not in waste_by_type:
+                waste_by_type[category] = {'quantity': 0, 'loss': 0}
+            waste_by_type[category]['quantity'] += record.quantity
+            waste_by_type[category]['loss'] += record.total_loss
+
+        return {
+            'total_loss': total_loss,
+            'total_quantity': total_quantity,
+            'by_type': waste_by_type
+        }
+
+
+# Патчимо ProductionOrder
+def patch_production_order():
+    """Додаємо нові методи до ProductionOrder"""
+    from production.models import ProductionOrder
+
+    ProductionOrder.get_actual_duration_hours = ProductionOrderExtended.get_actual_duration_hours
+    ProductionOrder.calculate_planned_duration = ProductionOrderExtended.calculate_planned_duration
+    ProductionOrder.get_efficiency_percent = ProductionOrderExtended.get_efficiency_percent
+    ProductionOrder.get_quality_summary = ProductionOrderExtended.get_quality_summary
+    ProductionOrder.get_waste_summary = ProductionOrderExtended.get_waste_summary
+
+
+# Ініціалізація всіх патчів
+def initialize_production_extensions():
+    """Ініціалізація всіх розширень"""
+    patch_production_line()
+    patch_production_order()
+
+
+# Викликаємо при імпорті модуля
+initialize_production_extensions()

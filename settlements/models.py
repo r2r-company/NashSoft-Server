@@ -1,6 +1,6 @@
 from decimal import Decimal
 from django.db import models
-from backend.models import Company, Firm, Supplier, Customer, Document, PaymentType
+from backend.models import Company, Firm, Supplier, Customer, Document, PaymentType, Currency
 
 MONEY_DOC_TYPES = [
     ('cash_income', 'Надходження готівки'),
@@ -19,6 +19,7 @@ class Account(models.Model):
     company = models.ForeignKey(Company, on_delete=models.CASCADE)
     name = models.CharField(max_length=100)
     type = models.CharField(max_length=10, choices=ACCOUNT_TYPE_CHOICES)
+    currency = models.ForeignKey(Currency, on_delete=models.CASCADE, default=1)
 
     class Meta:
         verbose_name = 'Каса-Банк'
