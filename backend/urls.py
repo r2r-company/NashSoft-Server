@@ -19,7 +19,7 @@ from backend.views import (
     ProductUnitConversionsView, ProductPricesView, ProductSpecificPriceView, ProductPricesDebugView,
     ProductPricesSimpleDebugView, ProductSalePreviewView, get_product_packaging, TrialBalanceView, BalanceSheetView,
     ProfitLossView, CostCenterAnalysisView, ExchangeRatesView, BudgetExecutionView, CashFlowForecastView,
-    LiquidityRiskView
+    LiquidityRiskView, ReceiptDocumentListView, SaleDocumentListView
 )
 from kkm.service.kkm.shift import ShiftStatusView, OpenShiftView, CloseShiftView
 from kkm.views import PrintMultiFirmReceiptsView
@@ -156,4 +156,7 @@ urlpatterns = [
     # === CASHFLOW ===
     path('finance/cashflow-forecast/', CashFlowForecastView.as_view(), name='cashflow_forecast'),
     path('finance/liquidity-risk/', LiquidityRiskView.as_view(), name='liquidity_risk'),
+    path('receipts-by-filter/', ReceiptDocumentListView.as_view(), name='receipts_by_filter'),
+    path("documents/sales/", SaleDocumentListView.as_view(), name="sale-documents"),
+
 ]

@@ -1,22 +1,18 @@
 from datetime import date, timedelta
 from decimal import Decimal
-
-import documents
 from django.contrib.auth import get_user_model
 from django.core.exceptions import ValidationError
-from django.shortcuts import  render
 from django.views.decorators.csrf import csrf_exempt
-from rest_framework.decorators import api_view
+from rest_framework.decorators import api_view, permission_classes
 from rest_framework.exceptions import NotFound
-from rest_framework.generics import ListAPIView, RetrieveAPIView, ListCreateAPIView, RetrieveUpdateAPIView, \
+from rest_framework.generics import ListAPIView,  ListCreateAPIView,  \
     RetrieveUpdateDestroyAPIView
-from rest_framework.permissions import IsAuthenticated, AllowAny
+from rest_framework.permissions import  AllowAny
 from rest_framework.views import APIView
 from rest_framework.response import Response
 from rest_framework import status, permissions, filters, generics, viewsets
-from django.db.models import Sum, Case, When, Value, DecimalField, F
 from backend.auth import CustomLoginSerializer
-from backend.models import Operation, Document, PriceSettingDocument, AppUser, Product, Company, \
+from backend.models import   PriceSettingDocument, AppUser, Product, Company, \
     Warehouse, Customer, Supplier, ProductGroup, Unit, PaymentType, Firm, Department, CustomerType, PriceType, \
     Interface, TradePoint, ProductUnitConversion, PriceSettingItem, BudgetPeriod, ExchangeRate
 from backend.operations.stock import FIFOStockManager
@@ -39,7 +35,9 @@ from backend.utils.responses import StandardResponse, DocumentActionResponse
 from backend.utils.unit_converter import convert_to_base
 from settlements.models import Account, Contract
 from settlements.serializers import ContractSerializer
-
+from django.shortcuts import render
+from django.db.models import Sum, Case, When, Value, DecimalField, F
+from backend.models import Operation, Document
 
 class DocumentPostView(APIView):
     permission_classes = [AllowAny]
@@ -82,17 +80,20 @@ class DocumentListView(APIView):
 
     def get(self, request):
         doc_type = request.query_params.get("type")
+        supplier_id = request.query_params.get("supplier")  # ✅ додаємо параметр
         queryset = Document.objects.all().order_by("-date")
 
         if doc_type:
             queryset = queryset.filter(doc_type=doc_type)
 
-        # ✅ ВИПРАВИТИ - ПОТРІБНА ПРАВИЛЬНА ПАГІНАЦІЯ:
+        if supplier_id:
+            queryset = queryset.filter(supplier_id=supplier_id)  # ✅ фільтрація по постачальнику
+
         serializer = DocumentListSerializer(queryset, many=True)
 
         return Response({
             "success": True,
-            "data": serializer.data,  # ✅ МАСИВ ДОКУМЕНТІВ
+            "data": serializer.data,
             "message": "Список документів отримано"
         }, status=200)
 
@@ -322,6 +323,7 @@ class TransferActionView(APIView):
 
 
 class ReturnToSupplierActionView(APIView):
+    permission_classes = [AllowAny]
     def get(self, request):
         doc_id = request.query_params.get("id")
         action = request.query_params.get("action")
@@ -357,6 +359,8 @@ class ReturnToSupplierActionView(APIView):
 
 
 class ReturnFromClientActionView(APIView):
+    permission_classes = [AllowAny]
+
     def get(self, request):
         doc_id = request.query_params.get("id")
         action = request.query_params.get("action")
@@ -637,9 +641,7 @@ class PriceSettingDocumentListView(APIView):
             return Response({"error": str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
 
-from django.shortcuts import render
-from django.db.models import Sum, Case, When, Value, DecimalField, F
-from backend.models import Operation, Document
+
 
 @csrf_exempt
 def stock_report(request):
@@ -2132,6 +2134,7 @@ class ProductSalePreviewView(APIView):
 
 
 @api_view(['GET'])
+@permission_classes([AllowAny])
 def get_product_packaging(request, product_id):
     """Отримати список фасувань для товару"""
     try:
@@ -2367,3 +2370,56 @@ class LiquidityRiskView(APIView):
 
         except Exception as e:
             return StandardResponse.error(str(e))
+
+
+
+
+class ReceiptDocumentListView(APIView):
+    permission_classes = [AllowAny]  # або твоя кастомна
+
+    def get(self, request):
+        company_id = request.query_params.get("company")
+        firm_id = request.query_params.get("firm")
+        warehouse_id = request.query_params.get("warehouse")
+
+        queryset = Document.objects.filter(doc_type="receipt").order_by("-date")
+
+        if company_id:
+            queryset = queryset.filter(company_id=company_id)
+        if firm_id:
+            queryset = queryset.filter(firm_id=firm_id)
+        if warehouse_id:
+            queryset = queryset.filter(warehouse_id=warehouse_id)
+
+        serializer = DocumentListSerializer(queryset, many=True)
+        return Response({
+            "success": True,
+            "data": serializer.data,
+            "message": "Знайдено документи поступлення"
+        })
+
+
+
+class SaleDocumentListView(APIView):
+    permission_classes = [AllowAny]  # або твоя кастомна
+
+    def get(self, request):
+        company_id = request.query_params.get("company")
+        firm_id = request.query_params.get("firm")
+        warehouse_id = request.query_params.get("warehouse")
+
+        queryset = Document.objects.filter(doc_type="sale").order_by("-date")
+
+        if company_id:
+            queryset = queryset.filter(company_id=company_id)
+        if firm_id:
+            queryset = queryset.filter(firm_id=firm_id)
+        if warehouse_id:
+            queryset = queryset.filter(warehouse_id=warehouse_id)
+
+        serializer = DocumentListSerializer(queryset, many=True)
+        return Response({
+            "success": True,
+            "data": serializer.data,
+            "message": "Знайдено документи реалізації"
+        })

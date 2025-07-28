@@ -219,17 +219,17 @@ class ReturnToSupplierService(BaseDocumentService):
                 raise InvalidReturnQuantityError(
                     f"Повернення '{item.product.name}' перевищує доступну кількість. Отримано: {total_received}, повернуто: {total_returned}, дозволено: {max_returnable}."
                 )
-
-            Operation.objects.create(
+            # ✅ ПРАВИЛЬНО: Використовуємо FIFO для списання при поверненні
+            total_cost = FIFOStockManager.sell_fifo(
                 document=self.document,
                 product=item.product,
-                quantity=converted_qty,
-                price=item.price,
                 warehouse=self.document.warehouse,
-                direction='out',
-                visible=True
+                quantity=converted_qty,
+                sale_price=item.price_without_vat or item.price  # Ціна повернення
             )
-            self.logger.log_event("return_supplier_item", f"Повернено постачальнику: {item.product.name} x {item.quantity}")
+
+            self.logger.log_event("return_supplier_fifo",
+                                  f"FIFO списання для повернення: {item.product.name} x {converted_qty}, собівартість: {total_cost}")
 
         self.document.status = 'posted'
         self.document.save()
